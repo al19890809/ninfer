@@ -1,12 +1,17 @@
-// NINFER_L20 / sm_89 (Ada Lovelace) port -- NVFP4 weight-kernel stubs.
+// NINFER_L20 / sm_89 (Ada Lovelace) port -- stubs for FP4-dependent kernels.
 //
 // sm_89 has no MXF4/NVFP4 block-scale MMA (that PTX is sm_120a-only), so the
-// upstream NVFP4 *weight* kernels cannot be built for the L20. This translation
-// unit provides stub definitions for every NVFP4 weight symbol referenced by
-// the retained (architecture-independent) dispatch layers. Each stub throws a
-// clear std::runtime_error, so an NVFP4-weight artifact fails loudly at load /
-// first use instead of crashing. L20 builds are expected to run the
-// groupwise-int (Q4/Q5) artifacts; see the L20 port report.
+// upstream NVFP4 *weight* kernels cannot be built for the L20. The NVFP4/K8V4
+// *KV-cache* representation is unavailable as well: its encode side uses the
+// hardware `cvt .e2m1x2` FP4 conversion (sm_100a/sm_120a-only), so NVFP4/K8V4
+// KV can never be populated on sm_89 and its decode kernels are unreachable.
+//
+// This translation unit provides stub definitions for every excluded symbol
+// referenced by the retained (architecture-independent) dispatch layers. Each
+// stub throws a clear std::runtime_error, so an NVFP4-weight artifact or an
+// NVFP4/K8V4 KV selection fails loudly at load / first use instead of
+// crashing. L20 builds are expected to run the groupwise-int (Q4/Q5)
+// artifacts with bf16 / int8 / fp8 KV; see the L20 port report.
 //
 // This file is compiled only when NINFER_L20_NO_PDL is defined (sm_89 build).
 
@@ -23,6 +28,8 @@
 #include "ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_plan.h"
 #include "ops/linear/nvfp4/nvfp4_geometry.h"
 #include "ops/softmax_attention/dense/causal_cache/prompt_nvfp4_non_rdc_launch.h"
+#include "ops/kv_cache/append/launch.h"
+#include "ops/softmax_attention/dense/causal_cache/launch.h"
 
 #include <cuda_runtime.h>
 
@@ -189,6 +196,71 @@ void causal_attention_prompt_nvfp4_batch_kernel_launch(const Tensor&, const Tens
                                                        const PagedKVBatchLayerView&, Tensor&,
                                                        cudaStream_t) {
     nvfp4_unsupported();
+}
+
+// --- NVFP4/K8V4 KV-cache symbols --------------------------------------------
+// The encode side of the NVFP4/K8V4 KV representation uses the hardware
+// `cvt .e2m1x2` conversion (sm_100a/sm_120a-only), so that representation can
+// never be populated on sm_89 and its decode kernels are unreachable. These
+// stubs cover every such symbol referenced by the retained dispatch layers.
+[[noreturn]] void kv_fp4_unsupported() {
+    throw std::runtime_error(
+        "NVFP4/K8V4 KV cache is not supported on this build (sm_89 / NVIDIA L20): "
+        "the e2m1 FP4 conversion is sm_100a/sm_120a-only hardware. Use "
+        "--kv-dtype bf16, int8, or fp8.");
+}
+
+void kv_cache_append_nvfp4_launch(const Tensor&, const Tensor&, const Tensor&, PagedKVLayerView,
+                                  cudaStream_t) {
+    kv_fp4_unsupported();
+}
+void kv_cache_append_nvfp4_batch_launch(const Tensor&, const Tensor&, const Tensor&,
+                                        const Tensor&, const Tensor&, PagedKVBatchLayerView,
+                                        cudaStream_t) {
+    kv_fp4_unsupported();
+}
+void kv_cache_append_k8v4_launch(const Tensor&, const Tensor&, const Tensor&, PagedKVLayerView,
+                                 cudaStream_t) {
+    kv_fp4_unsupported();
+}
+void kv_cache_append_k8v4_batch_launch(const Tensor&, const Tensor&, const Tensor&,
+                                       const Tensor&, const Tensor&, PagedKVBatchLayerView,
+                                       cudaStream_t) {
+    kv_fp4_unsupported();
+}
+
+void causal_attention_small_t_nvfp4_launch(
+    const Tensor&, const Tensor&, const Tensor&, const Tensor&, const Tensor&, const Tensor&,
+    float, PagedKVBatchLayerView, CausalAttentionExecutionEnvelope, std::int32_t, std::int32_t,
+    Tensor&, Tensor&, Tensor&, Tensor&, cudaStream_t) {
+    kv_fp4_unsupported();
+}
+void causal_attention_small_t_k8v4_launch(
+    const Tensor&, const Tensor&, const Tensor&, const Tensor&, const Tensor&, const Tensor&,
+    float, PagedKVBatchLayerView, CausalAttentionExecutionEnvelope, std::int32_t, std::int32_t,
+    Tensor&, Tensor&, Tensor&, Tensor&, cudaStream_t) {
+    kv_fp4_unsupported();
+}
+void causal_attention_cached_small_t_nvfp4_launch(const Tensor&, const Tensor&, float,
+                                                  const PagedKVLayerView&,
+                                                  CausalAttentionExecutionEnvelope, Tensor&,
+                                                  Tensor&, Tensor&, Tensor&, cudaStream_t) {
+    kv_fp4_unsupported();
+}
+void causal_attention_cached_small_t_k8v4_launch(const Tensor&, const Tensor&, float,
+                                                 const PagedKVLayerView&,
+                                                 CausalAttentionExecutionEnvelope, Tensor&,
+                                                 Tensor&, Tensor&, Tensor&, cudaStream_t) {
+    kv_fp4_unsupported();
+}
+void causal_attention_prompt_k8v4_launch(const Tensor&, const Tensor&, const Tensor&,
+                                         const Tensor&, const Tensor&, const Tensor&, float,
+                                         PagedKVBatchLayerView, Tensor&, cudaStream_t) {
+    kv_fp4_unsupported();
+}
+void causal_attention_prompt_k8v4_attention_launch(const Tensor&, const Tensor&, float,
+                                                   const PagedKVLayerView&, Tensor&, cudaStream_t) {
+    kv_fp4_unsupported();
 }
 
 } // namespace ninfer::ops::detail

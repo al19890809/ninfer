@@ -59,8 +59,9 @@ __device__ __forceinline__ void mma_s8(int& c0, int& c1, int& c2, int& c3, unsig
 __device__ __forceinline__ void mma_fp8_e4m3(float& c0, float& c1, float& c2, float& c3,
                                              unsigned a0, unsigned a1, unsigned a2, unsigned a3,
                                              unsigned b0, unsigned b1) {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 120)
-    // Blackwell (sm_120a) form used upstream.
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1200)
+    // Blackwell (sm_120a) form used upstream. __CUDA_ARCH__ is 890 for sm_89 and
+    // 1200 for sm_120a, so the Blackwell gate compares against 1200.
     asm volatile("mma.sync.aligned.kind::f8f6f4.m16n8k32.row.col.f32.e4m3.e4m3.f32 "
                  "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
                  : "+f"(c0), "+f"(c1), "+f"(c2), "+f"(c3)
@@ -99,7 +100,7 @@ __device__ __forceinline__ void mma_nvfp4_e4m3(float& c0, float& c1, float& c2, 
     // NINFER_L20 / sm_89: mxf4nvf4 block-scale MMA is sm_120a-only. Guard it so
     // mma.cuh stays includable; the NVFP4 *weight* callers are excluded from the
     // sm_89 build, so this branch is never instantiated there.
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 120)
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1200)
     asm volatile("mma.sync.aligned.kind::mxf4nvf4.block_scale.scale_vec::4X."
                  "m16n8k64.row.col.f32.e2m1.e2m1.f32.ue4m3 "
                  "{%0,%1,%2,%3}, "
