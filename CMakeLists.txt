@@ -1,14 +1,16 @@
 cmake_minimum_required(VERSION 3.28)
 
-# The current implementation is compiled only for sm_120a. Set and validate the
-# architecture before CUDA compiler detection so CMake never injects a generic
-# host-toolchain default or accepts an unsupported target.
+# NINFER_L20 port: build for Ada (sm_89) by default. sm_120a remains supported.
+# Supported values: "89" (NVIDIA L20 / Ada Lovelace) and "120a" (RTX 5090 / Blackwell).
 if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
-  set(CMAKE_CUDA_ARCHITECTURES 120a CACHE STRING "CUDA architectures to build")
+  set(CMAKE_CUDA_ARCHITECTURES 89 CACHE STRING "CUDA architectures to build")
 endif()
-if(NOT CMAKE_CUDA_ARCHITECTURES STREQUAL "120a")
+if(CMAKE_CUDA_ARCHITECTURES STREQUAL "89")
+  # Ada Lovelace (L20): no sm_90+ PDL; tell pdl.cuh to use plain launches.
+  add_compile_definitions($<$<COMPILE_LANGUAGE:CUDA>:NINFER_L20_NO_PDL>)
+elseif(NOT CMAKE_CUDA_ARCHITECTURES STREQUAL "120a")
   message(FATAL_ERROR
-    "NInfer supports only CMAKE_CUDA_ARCHITECTURES=120a; got "
+    "NInfer supports CMAKE_CUDA_ARCHITECTURES=89 (L20) or 120a (RTX 5090); got "
     "'${CMAKE_CUDA_ARCHITECTURES}'")
 endif()
 
