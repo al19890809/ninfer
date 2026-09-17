@@ -4,6 +4,7 @@
 // weight tile while N-groups cover disjoint column ranges. Output owns the
 // physical direct-write policy.
 
+#include "ops/common/launch_smem.cuh"
 #include "ops/linear/q8/q8_ksplit_mma.cuh"
 
 #include <cuda_bf16.h>
@@ -12,6 +13,21 @@
 #include <cstdint>
 
 namespace ninfer::ops::detail {
+
+// The contraction owns the shared layout; launch sites use the same type to
+// size the dynamic allocation (see launch_kernel_with_smem). sm_89 caps static
+// shared memory at 48 KB per CTA, so this storage lives in the dynamic pool.
+template <int TileCols, int KSplits, int NGroups>
+struct alignas(16) Q8KSplitGroupedShared {
+    static constexpr int kTileK       = 64;
+    static constexpr int kMmaRows     = 16;
+    static constexpr int kKernelWarps = KSplits * NGroups;
+    static constexpr int kGroupK      = KSplits * kTileK;
+    static constexpr int kWarpCols    = TileCols / NGroups;
+
+    std::uint8_t code_shared[kMmaRows][kGroupK];
+    __nv_bfloat16 b_shared[kKernelWarps][kWarpCols * kTileK];
+};
 
 template <int Hidden, int TileCols, int KSplits, int NGroups, int MinBlocks, class Output,
           bool AddResidual = false, bool TiledColumns = false>
@@ -31,8 +47,19 @@ __global__ __launch_bounds__(KSplits* NGroups * 32, MinBlocks) void q8_ksplit_gr
     static_assert(TileCols % NGroups == 0 && kWarpCols % 8 == 0);
     static_assert(Hidden % kGroupK == 0 && kKernelWarps <= 32);
 
-    __shared__ __align__(16) std::uint8_t code_shared[kMmaRows][kGroupK];
-    __shared__ __align__(16) __nv_bfloat16 b_shared[kKernelWarps][kWarpCols * kTileK];
+    // sm_89 (Ada) caps static shared memory at 48 KB per CTA (sm_120a accepts
+    // the full per-CTA shared memory). Storage above the limit uses the dynamic
+    // pool that launch_kernel_with_smem sizes at launch; smaller storage keeps
+    // the static allocation, matching the original launch contract.
+    using SharedStorage = Q8KSplitGroupedShared<TileCols, KSplits, NGroups>;
+    constexpr bool kDynamicShared = sizeof(SharedStorage) > kStaticSharedLimitBytes;
+    __shared__ __align__(
+        16) unsigned char static_shared[kDynamicShared ? 1 : sizeof(SharedStorage)];
+    extern __shared__ __align__(16) unsigned char dynamic_shared[];
+    auto& shared =
+        *reinterpret_cast<SharedStorage*>(kDynamicShared ? dynamic_shared : static_shared);
+    auto& code_shared  = shared.code_shared;
+    auto& b_shared     = shared.b_shared;
 
     const int tid        = static_cast<int>(threadIdx.x);
     const int warp       = tid >> 5;

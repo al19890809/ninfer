@@ -2,6 +2,7 @@
 add_library(ninfer_ops STATIC)
 ninfer_internal_includes(ninfer_ops)
 ninfer_cuda_archive(ninfer_ops)
+target_link_libraries(ninfer_ops PUBLIC ninfer_core)
 
 # NINFER_L20 / sm_89 (Ada) port:
 # sm_89 has no NVFP4 *weight* MMA, so the NVFP4 weight kernels are excluded and
@@ -13,7 +14,7 @@ if(CMAKE_CUDA_ARCHITECTURES STREQUAL "89")
   target_sources(ninfer_ops PRIVATE "${CMAKE_CURRENT_LIST_DIR}/nvfp4_l20_stub.cpp")
 else()
   set(NINFER_NO_NVFP4_WEIGHTS OFF)
-  target_link_libraries(ninfer_ops PUBLIC ninfer_core PRIVATE ninfer_nvfp4_non_rdc)
+  target_link_libraries(ninfer_ops PRIVATE ninfer_nvfp4_non_rdc)
 
   # Warp-specialized SM120 NVFP4 kernels use setmaxnreg to transfer registers
   # from producer to consumer warpgroups. RDC makes ptxas discard that contract.

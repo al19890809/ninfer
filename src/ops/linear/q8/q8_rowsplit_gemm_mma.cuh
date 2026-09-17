@@ -8,6 +8,7 @@
 // shared tile; x uses a two-stage cp.async pipeline. Tensor Cores execute
 // m16n8k16 BF16 MMA with FP32 accumulation.
 
+#include "ops/common/launch_smem.cuh"
 #include "ops/common/mma.cuh"
 #include "ops/common/math.cuh"
 #include "ops/linear/q8/q8_rowsplit_output.cuh"
@@ -62,6 +63,20 @@ __device__ __forceinline__ int q8_g32_swz64(int row, int col) {
     return (((col >> 3) ^ (row & 7)) << 3) | (col & 7);
 }
 
+// The contraction owns the shared layout; launch sites use the same type to
+// size the dynamic allocation (see launch_kernel_with_smem).
+template <class Cfg, Q8Epilogue Epilogue>
+union alignas(16) Q8RowSplitSharedStorage {
+    struct {
+        alignas(16) __nv_bfloat16 weights[Cfg::BM * Cfg::BK];
+        alignas(16) __nv_bfloat16 activations[Cfg::ACTIVATION_STAGES][Cfg::BN * Cfg::BK];
+        alignas(16) std::uint8_t codes[Cfg::BM * Cfg::BK];
+        alignas(16) std::uint8_t scales[Cfg::BM * Cfg::SCALE_CACHE_BYTES];
+    } operands;
+
+    float projected[Epilogue == Q8Epilogue::Residual ? Cfg::BM * Cfg::BN : 1];
+};
+
 template <class Cfg, bool Full, Q8Epilogue Epilogue = Q8Epilogue::Store,
           class Output = Q8ContiguousOutput>
 __global__ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void q8_rowsplit_gemm_mma_kernel(
@@ -82,20 +97,19 @@ __global__ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void q8_rowsplit_gem
     static_assert(!kSwiGlu || Cfg::WARPS_M == 1 || Cfg::WARPS_M == 2,
                   "SwiGLU supports warp-local or shared-memory row pairing");
 
-    struct OperandStorage {
-        alignas(16) __nv_bfloat16 weights[BM * BK];
-        alignas(16) __nv_bfloat16 activations[Cfg::ACTIVATION_STAGES][BN * BK];
-        alignas(16) std::uint8_t codes[BM * BK];
-        alignas(16) std::uint8_t scales[BM * Cfg::SCALE_CACHE_BYTES];
-    };
-
-    union SharedStorage {
-        OperandStorage operands;
-        float projected[Epilogue == Q8Epilogue::Residual ? BM * BN : 1];
-    };
-
+    using SharedStorage = Q8RowSplitSharedStorage<Cfg, Epilogue>;
     static_assert(sizeof(SharedStorage) <= 99 * 1024);
-    __shared__ __align__(16) SharedStorage shared;
+
+    // sm_89 (Ada) caps static shared memory at 48 KB per CTA (sm_120a accepts
+    // the full per-CTA shared memory). Storage above the limit uses the dynamic
+    // pool that launch_kernel_with_smem sizes at launch; smaller storage keeps
+    // the static allocation, matching the original launch contract.
+    constexpr bool kDynamicShared = sizeof(SharedStorage) > kStaticSharedLimitBytes;
+    __shared__ __align__(
+        16) unsigned char static_shared[kDynamicShared ? 1 : sizeof(SharedStorage)];
+    extern __shared__ __align__(16) unsigned char dynamic_shared[];
+    auto& shared =
+        *reinterpret_cast<SharedStorage*>(kDynamicShared ? dynamic_shared : static_shared);
     auto& As = shared.operands.weights;
     auto& Bs = shared.operands.activations;
     auto& Cr = shared.operands.codes;

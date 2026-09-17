@@ -8,6 +8,7 @@
 // the CTA reduces FP32 partials in shared memory. Output owns physical row/token addressing; an
 // optional caller epilogue may instead consume the FP32 tile.
 
+#include "ops/common/launch_smem.cuh"
 #include "ops/common/mma.cuh"
 #include "ops/common/memory.cuh"
 #include "ops/linear/q8/q8_ksplit_config.h"
@@ -104,7 +105,9 @@ q8_ksplit_mma(const __nv_bfloat16* __restrict__ x, const std::uint8_t* __restric
 
     using SharedStorage = Q8KSplitSharedStorage<Schedule>;
 
-    constexpr bool kDynamicShared = TiledColumns && ActiveCols > 64;
+    // sm_89 (Ada) caps static shared memory at 48 KB per CTA; storage above the
+    // limit uses the dynamic pool that launch_kernel_with_smem sizes at launch.
+    constexpr bool kDynamicShared = sizeof(SharedStorage) > kStaticSharedLimitBytes;
     __shared__ __align__(
         16) unsigned char static_shared[kDynamicShared ? 1 : sizeof(SharedStorage)];
     extern __shared__ __align__(16) unsigned char dynamic_shared[];
