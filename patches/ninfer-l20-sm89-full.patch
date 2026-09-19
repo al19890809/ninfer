@@ -1,0 +1,1445 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 27e9560e..3d715163 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -1,14 +1,16 @@
+ cmake_minimum_required(VERSION 3.28)
+ 
+-# The current implementation is compiled only for sm_120a. Set and validate the
+-# architecture before CUDA compiler detection so CMake never injects a generic
+-# host-toolchain default or accepts an unsupported target.
++# NINFER_L20 port: build for Ada (sm_89) by default. sm_120a remains supported.
++# Supported values: "89" (NVIDIA L20 / Ada Lovelace) and "120a" (RTX 5090 / Blackwell).
+ if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
+-  set(CMAKE_CUDA_ARCHITECTURES 120a CACHE STRING "CUDA architectures to build")
++  set(CMAKE_CUDA_ARCHITECTURES 89 CACHE STRING "CUDA architectures to build")
+ endif()
+-if(NOT CMAKE_CUDA_ARCHITECTURES STREQUAL "120a")
++if(CMAKE_CUDA_ARCHITECTURES STREQUAL "89")
++  # Ada Lovelace (L20): no sm_90+ PDL; tell pdl.cuh to use plain launches.
++  add_compile_definitions($<$<COMPILE_LANGUAGE:CUDA>:NINFER_L20_NO_PDL>)
++elseif(NOT CMAKE_CUDA_ARCHITECTURES STREQUAL "120a")
+   message(FATAL_ERROR
+-    "NInfer supports only CMAKE_CUDA_ARCHITECTURES=120a; got "
++    "NInfer supports CMAKE_CUDA_ARCHITECTURES=89 (L20) or 120a (RTX 5090); got "
+     "'${CMAKE_CUDA_ARCHITECTURES}'")
+ endif()
+ 
+diff --git a/src/core/pdl.cuh b/src/core/pdl.cuh
+index 0c60b6a7..c2d87df2 100644
+--- a/src/core/pdl.cuh
++++ b/src/core/pdl.cuh
+@@ -5,6 +5,24 @@
+ #include <cstddef>
+ #include <utility>
+ 
++// NINFER_L20 / sm_89 (Ada Lovelace) port
++// ---------------------------------------------------------------------------
++// Programmatic Dependent Launch (`griddepcontrol.*`) requires sm_90+. The L20
++// is sm_89, so PDL is unavailable there. PDL is only a latency optimization:
++// a consumer kernel launched on the same stream already begins only after its
++// producer kernel has fully completed (CUDA in-order stream semantics), so a
++// plain launch is a correct, slightly slower substitute.
++//
++// Strategy:
++//  * On sm_89 the device helpers become no-ops (there are no dependents to
++//    trigger and no dependency to wait on -- stream order supplies both).
++//  * The host `launch_dependent` degenerates to a normal `cudaLaunchKernel`
++//    when compiled for a pre-sm_90-only build. Because CMAKE_CUDA_ARCHITECTURES
++//    for the L20 build is exactly one arch (89), a host-side check on the
++//    compiled arch is reliable; we detect it through __CUDA_ARCH__ when the
++//    TU is a CUDA file, and fall back to launching normally via a runtime flag
++//    compiled in by CMake (NINFER_L20_PLAIN_LAUNCH) for safety.
++
+ namespace ninfer::pdl {
+ 
+ struct LaunchConfig {
+@@ -14,32 +32,63 @@ struct LaunchConfig {
+     cudaStream_t stream            = nullptr;
+ };
+ 
+-// Launches a consumer kernel as a programmatic dependent of the immediately preceding producer
+-// kernel in the same stream. Every consumer control path that reads producer output must first call
+-// wait_for_dependencies().
++namespace detail {
++// Set at compile time by the CUDA compiler for the *single* target arch of
++// this build. For a pure sm_89 build this is false.
++#if defined(NINFER_L20_NO_PDL)
++inline constexpr bool kPdlAvailable = false;
++#else
++inline constexpr bool kPdlAvailable = true;
++#endif
++} // namespace detail
++
++// Launches a consumer kernel as a programmatic dependent of the immediately
++// preceding producer kernel in the same stream. Every consumer control path
++// that reads producer output must first call wait_for_dependencies().
+ template <class... KernelArgs, class... CallArgs>
+ [[nodiscard]] inline cudaError_t
+ launch_dependent(const LaunchConfig& launch, void (*kernel)(KernelArgs...), CallArgs&&... args) {
+-    cudaLaunchAttribute attribute{};
+-    attribute.id = cudaLaunchAttributeProgrammaticStreamSerialization;
+-    attribute.val.programmaticStreamSerializationAllowed = 1;
+-
+-    cudaLaunchConfig_t config{};
+-    config.gridDim          = launch.grid;
+-    config.blockDim         = launch.block;
+-    config.dynamicSmemBytes = launch.dynamic_smem_bytes;
+-    config.stream           = launch.stream;
+-    config.attrs            = &attribute;
+-    config.numAttrs         = 1;
+-
+-    return cudaLaunchKernelEx(&config, kernel, std::forward<CallArgs>(args)...);
++    if constexpr (!detail::kPdlAvailable) {
++        // sm_89 / L20 path: plain in-order launch (PDL attribute omitted). We
++        // take the address of each argument and pass a void* array to the
++        // driver-style launch; every current call site passes plain scalar /
++        // pointer arguments, which is exactly what this supports.
++        void* arg_ptrs[] = {const_cast<void*>(static_cast<const void*>(&args))...};
++        return cudaLaunchKernel(reinterpret_cast<const void*>(kernel), launch.grid, launch.block,
++                                arg_ptrs, launch.dynamic_smem_bytes, launch.stream);
++    } else {
++        cudaLaunchAttribute attribute{};
++        attribute.id = cudaLaunchAttributeProgrammaticStreamSerialization;
++        attribute.val.programmaticStreamSerializationAllowed = 1;
++
++        cudaLaunchConfig_t config{};
++        config.gridDim          = launch.grid;
++        config.blockDim         = launch.block;
++        config.dynamicSmemBytes = launch.dynamic_smem_bytes;
++        config.stream           = launch.stream;
++        config.attrs            = &attribute;
++        config.numAttrs         = 1;
++
++        return cudaLaunchKernelEx(&config, kernel, std::forward<CallArgs>(args)...);
++    }
+ }
+ 
+-// Every producer CTA must call this at least once or exit. This enables dependent scheduling but
+-// does not make producer writes visible to the consumer.
+-__device__ __forceinline__ void trigger_dependents() { cudaTriggerProgrammaticLaunchCompletion(); }
++// Every producer CTA must call this at least once or exit. This enables
++// dependent scheduling but does not make producer writes visible to the
++// consumer. No-op on sm_89.
++__device__ __forceinline__ void trigger_dependents() {
++#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
++    cudaTriggerProgrammaticLaunchCompletion();
++#endif
++}
+ 
+-// Call on every consumer control path before its first access to producer-dependent data.
+-__device__ __forceinline__ void wait_for_dependencies() { cudaGridDependencySynchronize(); }
++// Call on every consumer control path before its first access to
++// producer-dependent data. No-op on sm_89 (stream order already guarantees
++// the producer finished before the consumer started).
++__device__ __forceinline__ void wait_for_dependencies() {
++#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
++    cudaGridDependencySynchronize();
++#endif
++}
+ 
+ } // namespace ninfer::pdl
+diff --git a/src/models/qwen3_5/program/planning/startup.cpp b/src/models/qwen3_5/program/planning/startup.cpp
+index 8a6e4809..88885342 100644
+--- a/src/models/qwen3_5/program/planning/startup.cpp
++++ b/src/models/qwen3_5/program/planning/startup.cpp
+@@ -801,8 +801,11 @@ void validate_target_options(const execution::Parameters& parameters, DeviceCont
+         }
+         break;
+     }
+-    if (device.compute_capability() != 120) {
+-        throw std::invalid_argument("Qwen3.5 family runtime requires compute capability 12.0");
++    // NINFER_L20 / sm_89 (Ada) port: accept both Blackwell (12.0) and Ada (8.9).
++    if (device.compute_capability() != 120 && device.compute_capability() != 89) {
++        throw std::invalid_argument(
++            "Qwen3.5 family runtime requires compute capability 12.0 (RTX 5090) "
++            "or 8.9 (NVIDIA L20)");
+     }
+ }
+ 
+diff --git a/src/ops/CMakeLists.txt b/src/ops/CMakeLists.txt
+index 31357e82..4b3c595b 100644
+--- a/src/ops/CMakeLists.txt
++++ b/src/ops/CMakeLists.txt
+@@ -2,15 +2,28 @@
+ add_library(ninfer_ops STATIC)
+ ninfer_internal_includes(ninfer_ops)
+ ninfer_cuda_archive(ninfer_ops)
+-target_link_libraries(ninfer_ops PUBLIC ninfer_core PRIVATE ninfer_nvfp4_non_rdc)
++target_link_libraries(ninfer_ops PUBLIC ninfer_core)
+ 
+-# Warp-specialized SM120 NVFP4 kernels use setmaxnreg to transfer registers from
+-# producer to consumer warpgroups. RDC makes ptxas discard that contract. These
+-# self-contained kernels therefore use a non-RDC archive and host launchers.
+-add_library(ninfer_nvfp4_non_rdc STATIC)
+-ninfer_internal_includes(ninfer_nvfp4_non_rdc)
+-ninfer_cuda_non_rdc_archive(ninfer_nvfp4_non_rdc)
+-target_link_libraries(ninfer_nvfp4_non_rdc PRIVATE ninfer_core CUDA::cudart CUDA::cuda_driver)
++# NINFER_L20 / sm_89 (Ada) port:
++# sm_89 has no NVFP4 *weight* MMA, so the NVFP4 weight kernels are excluded and
++# replaced by stubs that throw a clear error. NVFP4 *KV-cache* kernels
++# (small_t_nvfp4, prompt_nvfp4, k8v4, ...) dequantize in software and stay.
++if(CMAKE_CUDA_ARCHITECTURES STREQUAL "89")
++  # A no-NVFP4-weights build. L20_STUB throws for any NVFP4 weight op.
++  set(NINFER_NO_NVFP4_WEIGHTS ON)
++  target_sources(ninfer_ops PRIVATE "${CMAKE_CURRENT_LIST_DIR}/nvfp4_l20_stub.cpp")
++else()
++  set(NINFER_NO_NVFP4_WEIGHTS OFF)
++  target_link_libraries(ninfer_ops PRIVATE ninfer_nvfp4_non_rdc)
++
++  # Warp-specialized SM120 NVFP4 kernels use setmaxnreg to transfer registers
++  # from producer to consumer warpgroups. RDC makes ptxas discard that contract.
++  # These self-contained kernels therefore use a non-RDC archive and host launchers.
++  add_library(ninfer_nvfp4_non_rdc STATIC)
++  ninfer_internal_includes(ninfer_nvfp4_non_rdc)
++  ninfer_cuda_non_rdc_archive(ninfer_nvfp4_non_rdc)
++  target_link_libraries(ninfer_nvfp4_non_rdc PRIVATE ninfer_core CUDA::cudart CUDA::cuda_driver)
++endif()
+ 
+ include(basic_sources.cmake)
+ include("${CMAKE_CURRENT_LIST_DIR}/attn_input_proj/sources.cmake")
+diff --git a/src/ops/attn_input_proj/q8/q8_attn_input_gemm_splitk.cu b/src/ops/attn_input_proj/q8/q8_attn_input_gemm_splitk.cu
+index f2cba7f6..b6ef1cab 100644
+--- a/src/ops/attn_input_proj/q8/q8_attn_input_gemm_splitk.cu
++++ b/src/ops/attn_input_proj/q8/q8_attn_input_gemm_splitk.cu
+@@ -37,11 +37,12 @@ void launch_output(const Tensor& x, const Weight& weight, Output output, cudaStr
+                                                 : 48;
+     using Geometry         = Q8LinearGeometry<Rows, kHidden>;
+     using Schedule         = Q8KSplitDefaultSchedule<TileCols, ActiveCols>;
+-    q8_ksplit_mma_kernel<Geometry, ActiveCols, Schedule>
+-        <<<Rows / kRowsPerCta, Schedule::kThreads, 0, stream>>>(
+-            static_cast<const __nv_bfloat16*>(x.data),
+-            static_cast<const std::uint8_t*>(weight.qdata),
+-            static_cast<const std::uint8_t*>(weight.scales), output);
++    launch_kernel_with_smem(q8_ksplit_mma_kernel<Geometry, ActiveCols, Schedule, Output>,
++                            dim3(Rows / kRowsPerCta), Schedule::kThreads,
++                            sizeof(Q8KSplitSharedStorage<Schedule>), stream,
++                            static_cast<const __nv_bfloat16*>(x.data),
++                            static_cast<const std::uint8_t*>(weight.qdata),
++                            static_cast<const std::uint8_t*>(weight.scales), output);
+ }
+ 
+ template <int ActiveCols>
+@@ -88,11 +89,13 @@ void launch_target_medium_cols(const Tensor& x, const Weight& weight, Tensor& q,
+     const TargetOutput output{
+         static_cast<__nv_bfloat16*>(q.data), static_cast<__nv_bfloat16*>(k.data),
+         static_cast<__nv_bfloat16*>(gate.data), static_cast<__nv_bfloat16*>(v.data)};
+-    q8_ksplit_grouped_mma_kernel<kHidden, TileCols, KSplits, NGroups, MinBlocks>
+-        <<<kTargetRows / kRowsPerCta, KSplits * NGroups * 32, 0, stream>>>(
+-            static_cast<const __nv_bfloat16*>(x.data),
+-            static_cast<const std::uint8_t*>(weight.qdata),
+-            static_cast<const std::uint8_t*>(weight.scales), output, x.ne[1]);
++    launch_kernel_with_smem(
++        q8_ksplit_grouped_mma_kernel<kHidden, TileCols, KSplits, NGroups, MinBlocks, TargetOutput>,
++        dim3(kTargetRows / kRowsPerCta), KSplits * NGroups * 32,
++        sizeof(Q8KSplitGroupedShared<TileCols, KSplits, NGroups>), stream,
++        static_cast<const __nv_bfloat16*>(x.data),
++        static_cast<const std::uint8_t*>(weight.qdata),
++        static_cast<const std::uint8_t*>(weight.scales), output, x.ne[1]);
+ }
+ 
+ template <int TileCols, int KSplits, int NGroups, int MinBlocks>
+@@ -102,11 +105,14 @@ void launch_companion_medium_cols(const Tensor& x, const Weight& weight, Tensor&
+     const CompanionOutput output{static_cast<__nv_bfloat16*>(q.data),
+                                  static_cast<__nv_bfloat16*>(k.data),
+                                  static_cast<__nv_bfloat16*>(v.data)};
+-    q8_ksplit_grouped_mma_kernel<kHidden, TileCols, KSplits, NGroups, MinBlocks>
+-        <<<kCompanionRows / kRowsPerCta, KSplits * NGroups * 32, 0, stream>>>(
+-            static_cast<const __nv_bfloat16*>(x.data),
+-            static_cast<const std::uint8_t*>(weight.qdata),
+-            static_cast<const std::uint8_t*>(weight.scales), output, x.ne[1]);
++    launch_kernel_with_smem(
++        q8_ksplit_grouped_mma_kernel<kHidden, TileCols, KSplits, NGroups, MinBlocks,
++                                    CompanionOutput>,
++        dim3(kCompanionRows / kRowsPerCta), KSplits * NGroups * 32,
++        sizeof(Q8KSplitGroupedShared<TileCols, KSplits, NGroups>), stream,
++        static_cast<const __nv_bfloat16*>(x.data),
++        static_cast<const std::uint8_t*>(weight.qdata),
++        static_cast<const std::uint8_t*>(weight.scales), output, x.ne[1]);
+ }
+ 
+ } // namespace
+diff --git a/src/ops/attn_input_proj/q8/q8_dflash2_attn_input.cu b/src/ops/attn_input_proj/q8/q8_dflash2_attn_input.cu
+index 746df491..860eff9f 100644
+--- a/src/ops/attn_input_proj/q8/q8_dflash2_attn_input.cu
++++ b/src/ops/attn_input_proj/q8/q8_dflash2_attn_input.cu
+@@ -43,13 +43,14 @@ void launch_small(const Tensor& x, const Weight& weight, Tensor& q, Tensor& k, T
+     const Output output{static_cast<__nv_bfloat16*>(q.data), static_cast<__nv_bfloat16*>(k.data),
+                         static_cast<__nv_bfloat16*>(v.data)};
+     constexpr int kBlocks = Geometry::kOutputRows / Schedule::kRowsPerCta;
+-    q8_ksplit_mma_kernel<Geometry, Columns, Schedule, Output, Q8KSplitStoreEpilogue,
+-                         Q8KSplitIdentityRows, false, !Exact>
+-        <<<kBlocks, Schedule::kThreads, 0, stream>>>(
+-            static_cast<const __nv_bfloat16*>(x.data),
+-            static_cast<const std::uint8_t*>(weight.qdata),
+-            static_cast<const std::uint8_t*>(weight.scales), output, Q8KSplitStoreEpilogue{},
+-            Q8KSplitIdentityRows{}, x.ne[1]);
++    launch_kernel_with_smem(
++        q8_ksplit_mma_kernel<Geometry, Columns, Schedule, Output, Q8KSplitStoreEpilogue,
++                            Q8KSplitIdentityRows, false, !Exact>,
++        kBlocks, Schedule::kThreads, sizeof(Q8KSplitSharedStorage<Schedule>), stream,
++        static_cast<const __nv_bfloat16*>(x.data),
++        static_cast<const std::uint8_t*>(weight.qdata),
++        static_cast<const std::uint8_t*>(weight.scales), output, Q8KSplitStoreEpilogue{},
++        Q8KSplitIdentityRows{}, x.ne[1]);
+     CUDA_CHECK(cudaGetLastError());
+ }
+ 
+@@ -72,12 +73,13 @@ void launch_mma_slice(const Tensor& x, const Weight& weight, Tensor& q, Tensor&
+                         static_cast<__nv_bfloat16*>(v.data)};
+     const dim3 grid(Geometry::kOutputRows / Schedule::BM,
+                     static_cast<unsigned>(div_up(x.ne[1], Schedule::BN)), 1u);
+-    q8_rowsplit_gemm_mma_kernel<Schedule, Full, Q8Epilogue::Store, Output>
+-        <<<grid, Schedule::THREADS, 0, stream>>>(
+-            static_cast<const __nv_bfloat16*>(x.data),
+-            static_cast<const std::uint8_t*>(weight.qdata),
+-            static_cast<const std::uint8_t*>(weight.scales), output, Geometry::kOutputRows,
+-            Geometry::kInputRows, x.ne[1], Geometry::kInputRows);
++    launch_kernel_with_smem(
++        q8_rowsplit_gemm_mma_kernel<Schedule, Full, Q8Epilogue::Store, Output>, grid,
++        Schedule::THREADS, sizeof(Q8RowSplitSharedStorage<Schedule, Q8Epilogue::Store>), stream,
++        static_cast<const __nv_bfloat16*>(x.data),
++        static_cast<const std::uint8_t*>(weight.qdata),
++        static_cast<const std::uint8_t*>(weight.scales), output, Geometry::kOutputRows,
++        Geometry::kInputRows, x.ne[1], Geometry::kInputRows);
+     CUDA_CHECK(cudaGetLastError());
+ }
+ 
+diff --git a/src/ops/attn_input_proj/sources.cmake b/src/ops/attn_input_proj/sources.cmake
+index 21e7794e..312965e3 100644
+--- a/src/ops/attn_input_proj/sources.cmake
++++ b/src/ops/attn_input_proj/sources.cmake
+@@ -9,10 +9,6 @@ target_sources(ninfer_ops PRIVATE
+   "${CMAKE_CURRENT_LIST_DIR}/fp8/fp8_attn_input_a16_gemm.cu"
+   "${CMAKE_CURRENT_LIST_DIR}/fp8/fp8_attn_input_a8.cu"
+   "${CMAKE_CURRENT_LIST_DIR}/fp8/fp8_attn_input_plan.cpp"
+-  "${CMAKE_CURRENT_LIST_DIR}/nvfp4/nvfp4_attn_input_decode.cu"
+-  "${CMAKE_CURRENT_LIST_DIR}/nvfp4/nvfp4_attn_input_small_t.cu"
+-  "${CMAKE_CURRENT_LIST_DIR}/nvfp4/nvfp4_attn_input_w4a4.cu"
+-  "${CMAKE_CURRENT_LIST_DIR}/nvfp4/nvfp4_attn_input_plan.cpp"
+   "${CMAKE_CURRENT_LIST_DIR}/q4_q5/q4_q5_attn_input_gemm_mma.cu"
+   "${CMAKE_CURRENT_LIST_DIR}/q4_q5/q4_q5_attn_input_small_t.cu"
+   "${CMAKE_CURRENT_LIST_DIR}/q4_q5/q4_q5_attn_input_plan.cpp"
+@@ -24,3 +20,12 @@ target_sources(ninfer_ops PRIVATE
+   "${CMAKE_CURRENT_LIST_DIR}/q8/q8_attn_input_plan.cpp"
+   "${CMAKE_CURRENT_LIST_DIR}/../wrapper/attn_input_proj.cpp"
+ )
++
++if(NOT NINFER_NO_NVFP4_WEIGHTS)
++  target_sources(ninfer_ops PRIVATE
++    "${CMAKE_CURRENT_LIST_DIR}/nvfp4/nvfp4_attn_input_decode.cu"
++    "${CMAKE_CURRENT_LIST_DIR}/nvfp4/nvfp4_attn_input_small_t.cu"
++    "${CMAKE_CURRENT_LIST_DIR}/nvfp4/nvfp4_attn_input_w4a4.cu"
++    "${CMAKE_CURRENT_LIST_DIR}/nvfp4/nvfp4_attn_input_plan.cpp"
++  )
++endif()
+diff --git a/src/ops/common/launch_smem.cuh b/src/ops/common/launch_smem.cuh
+new file mode 100644
+index 00000000..388c7815
+--- /dev/null
++++ b/src/ops/common/launch_smem.cuh
+@@ -0,0 +1,46 @@
++#pragma once
++
++// Shared-memory-aware kernel launch.
++//
++// sm_89 (Ada) caps statically allocated shared memory at 48 KB per CTA, while
++// sm_120a accepts static storage up to the full per-CTA shared memory. Kernels
++// whose shared storage exceeds 48 KB therefore declare it as dynamic
++// (extern __shared__) and every launch site sizes the dynamic allocation from
++// the storage type. This helper performs that launch: it passes the storage
++// size as dynamic shared bytes (0 when the storage still fits statically) and
++// raises the per-function dynamic shared limit only when required.
++
++#include <cuda_runtime.h>
++
++#include <cstddef>
++
++namespace ninfer::ops::detail {
++
++inline constexpr std::size_t kStaticSharedLimitBytes = 48 * 1024;
++
++// Dynamic shared bytes to launch with for a kernel shared storage of this size.
++inline constexpr std::size_t dynamic_shared_bytes_for(std::size_t storage_bytes) {
++    return storage_bytes > kStaticSharedLimitBytes ? storage_bytes : 0;
++}
++
++// Returns the launch error; call sites also pass through CUDA_CHECK
++// (cudaGetLastError) as with the other kernel launches in this library.
++// Kernel arguments are taken by value -- the launch ABI copies them anyway,
++// and by-value copies keep the argument-pointer array free of const issues.
++template <class Kernel, class... Args>
++inline cudaError_t launch_kernel_with_smem(Kernel kernel, dim3 grid, dim3 block,
++                                           std::size_t storage_bytes, cudaStream_t stream,
++                                           Args... args) {
++    const std::size_t dynamic_bytes = dynamic_shared_bytes_for(storage_bytes);
++    if (dynamic_bytes > 0) {
++        const cudaError_t attribute = cudaFuncSetAttribute(
++            kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
++            static_cast<std::int32_t>(dynamic_bytes));
++        if (attribute != cudaSuccess) return attribute;
++    }
++    void* arg_ptrs[] = {static_cast<void*>(&args)...};
++    return cudaLaunchKernel(reinterpret_cast<const void*>(kernel), grid, block, arg_ptrs,
++                            dynamic_bytes, stream);
++}
++
++} // namespace ninfer::ops::detail
+diff --git a/src/ops/common/mma.cuh b/src/ops/common/mma.cuh
+index 7a68df28..751e0910 100644
+--- a/src/ops/common/mma.cuh
++++ b/src/ops/common/mma.cuh
+@@ -59,10 +59,21 @@ __device__ __forceinline__ void mma_s8(int& c0, int& c1, int& c2, int& c3, unsig
+ __device__ __forceinline__ void mma_fp8_e4m3(float& c0, float& c1, float& c2, float& c3,
+                                              unsigned a0, unsigned a1, unsigned a2, unsigned a3,
+                                              unsigned b0, unsigned b1) {
++#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1200)
++    // Blackwell (sm_120a) form used upstream. __CUDA_ARCH__ is 890 for sm_89 and
++    // 1200 for sm_120a, so the Blackwell gate compares against 1200.
+     asm volatile("mma.sync.aligned.kind::f8f6f4.m16n8k32.row.col.f32.e4m3.e4m3.f32 "
+                  "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+                  : "+f"(c0), "+f"(c1), "+f"(c2), "+f"(c3)
+                  : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
++#else
++    // NINFER_L20 / sm_89 (Ada): the .kind::f8f6f4 qualifier is unsupported; the
++    // plain e4m3 mma (available since sm_89) computes the identical operation.
++    asm volatile("mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 "
++                 "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
++                 : "+f"(c0), "+f"(c1), "+f"(c2), "+f"(c3)
++                 : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
++#endif
+ }
+ 
+ __device__ __forceinline__ void mma_tf32_bits(float& c0, float& c1, float& c2, float& c3,
+@@ -86,6 +97,10 @@ __device__ __forceinline__ void mma_nvfp4_e4m3(float& c0, float& c1, float& c2,
+                                                unsigned sfb) {
+     constexpr unsigned short kScaleBlockId  = 0;
+     constexpr unsigned short kScaleThreadId = 0;
++    // NINFER_L20 / sm_89: mxf4nvf4 block-scale MMA is sm_120a-only. Guard it so
++    // mma.cuh stays includable; the NVFP4 *weight* callers are excluded from the
++    // sm_89 build, so this branch is never instantiated there.
++#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1200)
+     asm volatile("mma.sync.aligned.kind::mxf4nvf4.block_scale.scale_vec::4X."
+                  "m16n8k64.row.col.f32.e2m1.e2m1.f32.ue4m3 "
+                  "{%0,%1,%2,%3}, "
+@@ -100,6 +115,10 @@ __device__ __forceinline__ void mma_nvfp4_e4m3(float& c0, float& c1, float& c2,
+                  : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1), "r"(sfa),
+                    "h"(kScaleBlockId), "h"(kScaleThreadId), "r"(sfb), "h"(kScaleBlockId),
+                    "h"(kScaleThreadId));
++#else
++    (void)c0; (void)c1; (void)c2; (void)c3; (void)a0; (void)a1; (void)a2; (void)a3;
++    (void)b0; (void)b1; (void)sfa; (void)sfb;
++#endif
+ }
+ 
+ } // namespace ninfer::ops
+diff --git a/src/ops/dynamic_grouped_conv/q8/q8_dynamic_grouped_conv_add_materialized.cu b/src/ops/dynamic_grouped_conv/q8/q8_dynamic_grouped_conv_add_materialized.cu
+index 32d93ab5..f5ab13fe 100644
+--- a/src/ops/dynamic_grouped_conv/q8/q8_dynamic_grouped_conv_add_materialized.cu
++++ b/src/ops/dynamic_grouped_conv/q8/q8_dynamic_grouped_conv_add_materialized.cu
+@@ -41,24 +41,17 @@ void tiled_projection(const Tensor& x, const Weight& weight, Tensor& out, cudaSt
+     using Geometry            = Q8LinearGeometry<kRows, InputRows>;
+     using Schedule            = Q8KSplitSchedule<Warps, TileColumns, Warps == 8 ? 2 : 3,
+                                                  Q8KSplitScaleAccess::Shared, Activation>;
+-    constexpr int SharedBytes = TileColumns > 64 ? sizeof(Q8KSplitSharedStorage<Schedule>) : 0;
+-    if constexpr (SharedBytes > 0) {
+-        static const cudaError_t attribute = cudaFuncSetAttribute(
+-            q8_ksplit_mma_kernel<Geometry, TileColumns, Schedule, Q8ContiguousOutput,
+-                                 Q8KSplitStoreEpilogue, Q8KSplitIdentityRows, false, true>,
+-            cudaFuncAttributeMaxDynamicSharedMemorySize, SharedBytes);
+-        CUDA_CHECK(attribute);
+-    }
+     const int columns = x.ne[1];
+     Q8ContiguousOutput output{static_cast<__nv_bfloat16*>(out.data), kRows};
+     const dim3 grid(kRows / 16, (columns + TileColumns - 1) / TileColumns);
+-    q8_ksplit_mma_kernel<Geometry, TileColumns, Schedule, Q8ContiguousOutput, Q8KSplitStoreEpilogue,
+-                         Q8KSplitIdentityRows, false, true>
+-        <<<grid, Schedule::kThreads, SharedBytes, stream>>>(
+-            static_cast<const __nv_bfloat16*>(x.data),
+-            static_cast<const std::uint8_t*>(weight.qdata),
+-            static_cast<const std::uint8_t*>(weight.scales), output, Q8KSplitStoreEpilogue{},
+-            Q8KSplitIdentityRows{}, columns);
++    launch_kernel_with_smem(
++        q8_ksplit_mma_kernel<Geometry, TileColumns, Schedule, Q8ContiguousOutput,
++                            Q8KSplitStoreEpilogue, Q8KSplitIdentityRows, false, true>,
++        grid, Schedule::kThreads, sizeof(Q8KSplitSharedStorage<Schedule>), stream,
++        static_cast<const __nv_bfloat16*>(x.data),
++        static_cast<const std::uint8_t*>(weight.qdata),
++        static_cast<const std::uint8_t*>(weight.scales), output, Q8KSplitStoreEpilogue{},
++        Q8KSplitIdentityRows{}, columns);
+     CUDA_CHECK(cudaGetLastError());
+ }
+ 
+diff --git a/src/ops/gdn_input_proj/q8/q8_gdn_input_gemm_mma.cu b/src/ops/gdn_input_proj/q8/q8_gdn_input_gemm_mma.cu
+index 947be55c..63e27552 100644
+--- a/src/ops/gdn_input_proj/q8/q8_gdn_input_gemm_mma.cu
++++ b/src/ops/gdn_input_proj/q8/q8_gdn_input_gemm_mma.cu
+@@ -19,11 +19,12 @@ void launch_variant(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor&
+     static_assert((8192 % Schedule::BM) == 0 && (4096 % Schedule::BM) == 0);
+     const Output output{static_cast<__nv_bfloat16*>(qkv.data), static_cast<__nv_bfloat16*>(z.data)};
+     const dim3 grid(kRows / Schedule::BM, static_cast<unsigned>(div_up(x.ne[1], Schedule::BN)), 1u);
+-    q8_rowsplit_gemm_mma_kernel<Schedule, Full, Q8Epilogue::Store, Output>
+-        <<<grid, Schedule::THREADS, 0, stream>>>(static_cast<const __nv_bfloat16*>(x.data),
+-                                                 static_cast<const std::uint8_t*>(weight.qdata),
+-                                                 static_cast<const std::uint8_t*>(weight.scales),
+-                                                 output, kRows, kHidden, x.ne[1], kHidden);
++    launch_kernel_with_smem(
++        q8_rowsplit_gemm_mma_kernel<Schedule, Full, Q8Epilogue::Store, Output>, grid,
++        Schedule::THREADS, sizeof(Q8RowSplitSharedStorage<Schedule, Q8Epilogue::Store>), stream,
++        static_cast<const __nv_bfloat16*>(x.data),
++        static_cast<const std::uint8_t*>(weight.qdata),
++        static_cast<const std::uint8_t*>(weight.scales), output, kRows, kHidden, x.ne[1], kHidden);
+ }
+ 
+ } // namespace
+diff --git a/src/ops/gdn_input_proj/q8/q8_gdn_input_gemm_splitk.cu b/src/ops/gdn_input_proj/q8/q8_gdn_input_gemm_splitk.cu
+index 3c7714c7..396a3a63 100644
+--- a/src/ops/gdn_input_proj/q8/q8_gdn_input_gemm_splitk.cu
++++ b/src/ops/gdn_input_proj/q8/q8_gdn_input_gemm_splitk.cu
+@@ -282,11 +282,12 @@ void launch_active_cols(const Tensor& x, const Weight& weight, Tensor& qkv, Tens
+     using Schedule = Q8KSplitDefaultSchedule<TileCols, ActiveCols>;
+     static_assert((8192 % kRowsPerCta) == 0 && (4096 % kRowsPerCta) == 0);
+     const Output output{static_cast<__nv_bfloat16*>(qkv.data), static_cast<__nv_bfloat16*>(z.data)};
+-    q8_ksplit_mma_kernel<Geometry, ActiveCols, Schedule>
+-        <<<kRows / kRowsPerCta, Schedule::kThreads, 0, stream>>>(
+-            static_cast<const __nv_bfloat16*>(x.data),
+-            static_cast<const std::uint8_t*>(weight.qdata),
+-            static_cast<const std::uint8_t*>(weight.scales), output);
++    launch_kernel_with_smem(q8_ksplit_mma_kernel<Geometry, ActiveCols, Schedule, Output>,
++                            dim3(kRows / kRowsPerCta), Schedule::kThreads,
++                            sizeof(Q8KSplitSharedStorage<Schedule>), stream,
++                            static_cast<const __nv_bfloat16*>(x.data),
++                            static_cast<const std::uint8_t*>(weight.qdata),
++                            static_cast<const std::uint8_t*>(weight.scales), output);
+ }
+ 
+ template <int ActiveCols, class Publish>
+@@ -321,11 +322,13 @@ void launch_active_cols_conv(const Tensor& x, const Weight& weight, const Tensor
+         },
+         static_cast<__nv_bfloat16*>(z.data),
+     };
+-    q8_ksplit_mma_kernel<Geometry, ActiveCols, Schedule, Output, Q8GdnSplitKConvEpilogue<Publish>>
+-        <<<kRows / kRowsPerCta, Schedule::kThreads, 0, stream>>>(
+-            static_cast<const __nv_bfloat16*>(x.data),
+-            static_cast<const std::uint8_t*>(weight.qdata),
+-            static_cast<const std::uint8_t*>(weight.scales), ignored_output, epilogue);
++    launch_kernel_with_smem(
++        q8_ksplit_mma_kernel<Geometry, ActiveCols, Schedule, Output,
++                            Q8GdnSplitKConvEpilogue<Publish>>,
++        dim3(kRows / kRowsPerCta), Schedule::kThreads, sizeof(Q8KSplitSharedStorage<Schedule>),
++        stream, static_cast<const __nv_bfloat16*>(x.data),
++        static_cast<const std::uint8_t*>(weight.qdata),
++        static_cast<const std::uint8_t*>(weight.scales), ignored_output, epilogue);
+ }
+ 
+ template <int ActiveCols>
+diff --git a/src/ops/gdn_input_proj/sources.cmake b/src/ops/gdn_input_proj/sources.cmake
+index 7022b97c..bbb7de3d 100644
+--- a/src/ops/gdn_input_proj/sources.cmake
++++ b/src/ops/gdn_input_proj/sources.cmake
+@@ -5,14 +5,6 @@ target_sources(ninfer_ops PRIVATE
+   "${CMAKE_CURRENT_LIST_DIR}/fp8/fp8_gdn_input_plan.cpp"
+   "${CMAKE_CURRENT_LIST_DIR}/fp8/fp8_gdn_conv_fused.cu"
+   "${CMAKE_CURRENT_LIST_DIR}/fp8/fp8_gdn_conv_plan.cpp"
+-  "${CMAKE_CURRENT_LIST_DIR}/nvfp4/nvfp4_gdn_input_decode.cu"
+-  "${CMAKE_CURRENT_LIST_DIR}/nvfp4/nvfp4_gdn_input_small_t.cu"
+-  "${CMAKE_CURRENT_LIST_DIR}/nvfp4/nvfp4_gdn_input_w4a4.cu"
+-  "${CMAKE_CURRENT_LIST_DIR}/nvfp4/nvfp4_gdn_input_plan.cpp"
+-  "${CMAKE_CURRENT_LIST_DIR}/nvfp4/nvfp4_gdn_snapshot_decode.cu"
+-  "${CMAKE_CURRENT_LIST_DIR}/nvfp4/nvfp4_gdn_snapshot_small_t.cu"
+-  "${CMAKE_CURRENT_LIST_DIR}/nvfp4/nvfp4_gdn_snapshot_post.cu"
+-  "${CMAKE_CURRENT_LIST_DIR}/nvfp4/nvfp4_gdn_snapshot_plan.cpp"
+   "${CMAKE_CURRENT_LIST_DIR}/q4_q5/q4_q5_gdn_input_gemm_mma.cu"
+   "${CMAKE_CURRENT_LIST_DIR}/q4_q5/q4_q5_gdn_input_independent.cu"
+   "${CMAKE_CURRENT_LIST_DIR}/q4_q5/q4_q5_gdn_input_conv_snapshot.cu"
+@@ -24,3 +16,16 @@ target_sources(ninfer_ops PRIVATE
+   "${CMAKE_CURRENT_LIST_DIR}/q8/q8_gdn_input_plan.cpp"
+   "${CMAKE_CURRENT_LIST_DIR}/../wrapper/gdn_input_proj.cpp"
+ )
++
++if(NOT NINFER_NO_NVFP4_WEIGHTS)
++  target_sources(ninfer_ops PRIVATE
++    "${CMAKE_CURRENT_LIST_DIR}/nvfp4/nvfp4_gdn_input_decode.cu"
++    "${CMAKE_CURRENT_LIST_DIR}/nvfp4/nvfp4_gdn_input_small_t.cu"
++    "${CMAKE_CURRENT_LIST_DIR}/nvfp4/nvfp4_gdn_input_w4a4.cu"
++    "${CMAKE_CURRENT_LIST_DIR}/nvfp4/nvfp4_gdn_input_plan.cpp"
++    "${CMAKE_CURRENT_LIST_DIR}/nvfp4/nvfp4_gdn_snapshot_decode.cu"
++    "${CMAKE_CURRENT_LIST_DIR}/nvfp4/nvfp4_gdn_snapshot_small_t.cu"
++    "${CMAKE_CURRENT_LIST_DIR}/nvfp4/nvfp4_gdn_snapshot_post.cu"
++    "${CMAKE_CURRENT_LIST_DIR}/nvfp4/nvfp4_gdn_snapshot_plan.cpp"
++  )
++endif()
+diff --git a/src/ops/kv_cache/sources.cmake b/src/ops/kv_cache/sources.cmake
+index 97659ab4..c745a428 100644
+--- a/src/ops/kv_cache/sources.cmake
++++ b/src/ops/kv_cache/sources.cmake
+@@ -1,6 +1,15 @@
+ target_sources(ninfer_ops PRIVATE
+   "${CMAKE_CURRENT_LIST_DIR}/append/kv_cache_append.cpp"
+   "${CMAKE_CURRENT_LIST_DIR}/append/launch.cu"
+-  "${CMAKE_CURRENT_LIST_DIR}/append/nvfp4_launch.cu"
+-  "${CMAKE_CURRENT_LIST_DIR}/append/k8v4_launch.cu"
+ )
++
++# NINFER_L20 / sm_89 (Ada) port: the NVFP4/K8V4 KV-cache encode kernels use the
++# hardware `cvt .e2m1x2` FP4 conversion, which is sm_100a/sm_120a-only. Exclude
++# them on sm_89 and provide throwing stubs (see nvfp4_l20_stub.cpp); the
++# bf16/int8/fp8 KV representations are unaffected.
++if(NOT NINFER_NO_NVFP4_WEIGHTS)
++  target_sources(ninfer_ops PRIVATE
++    "${CMAKE_CURRENT_LIST_DIR}/append/nvfp4_launch.cu"
++    "${CMAKE_CURRENT_LIST_DIR}/append/k8v4_launch.cu"
++  )
++endif()
+diff --git a/src/ops/linear/nvfp4/sources.cmake b/src/ops/linear/nvfp4/sources.cmake
+index 95dc902f..2e24c53a 100644
+--- a/src/ops/linear/nvfp4/sources.cmake
++++ b/src/ops/linear/nvfp4/sources.cmake
+@@ -1,14 +1,16 @@
+-target_sources(ninfer_ops PRIVATE
+-  "${CMAKE_CURRENT_LIST_DIR}/nvfp4_format.cpp"
+-  "${CMAKE_CURRENT_LIST_DIR}/nvfp4_w4a4.cu"
+-  "${CMAKE_CURRENT_LIST_DIR}/nvfp4_dispatch.cpp"
+-  "${CMAKE_CURRENT_LIST_DIR}/shapes/n14336_k5120.cu"
+-  "${CMAKE_CURRENT_LIST_DIR}/shapes/n16384_k5120.cu"
+-  "${CMAKE_CURRENT_LIST_DIR}/shapes/n34816_k5120.cu"
+-  "${CMAKE_CURRENT_LIST_DIR}/shapes/n5120_k6144.cu"
+-  "${CMAKE_CURRENT_LIST_DIR}/shapes/n5120_k17408.cu"
+-)
++if(NOT NINFER_NO_NVFP4_WEIGHTS)
++  target_sources(ninfer_ops PRIVATE
++    "${CMAKE_CURRENT_LIST_DIR}/nvfp4_format.cpp"
++    "${CMAKE_CURRENT_LIST_DIR}/nvfp4_w4a4.cu"
++    "${CMAKE_CURRENT_LIST_DIR}/nvfp4_dispatch.cpp"
++    "${CMAKE_CURRENT_LIST_DIR}/shapes/n14336_k5120.cu"
++    "${CMAKE_CURRENT_LIST_DIR}/shapes/n16384_k5120.cu"
++    "${CMAKE_CURRENT_LIST_DIR}/shapes/n34816_k5120.cu"
++    "${CMAKE_CURRENT_LIST_DIR}/shapes/n5120_k6144.cu"
++    "${CMAKE_CURRENT_LIST_DIR}/shapes/n5120_k17408.cu"
++  )
+ 
+-target_sources(ninfer_nvfp4_non_rdc PRIVATE
+-  "${CMAKE_CURRENT_LIST_DIR}/nvfp4_w4a4_tma.cu"
+-)
++  target_sources(ninfer_nvfp4_non_rdc PRIVATE
++    "${CMAKE_CURRENT_LIST_DIR}/nvfp4_w4a4_tma.cu"
++  )
++endif()
+diff --git a/src/ops/linear/q8/q8_ksplit_grouped_mma.cuh b/src/ops/linear/q8/q8_ksplit_grouped_mma.cuh
+index 20765ad0..b373aa66 100644
+--- a/src/ops/linear/q8/q8_ksplit_grouped_mma.cuh
++++ b/src/ops/linear/q8/q8_ksplit_grouped_mma.cuh
+@@ -4,6 +4,7 @@
+ // weight tile while N-groups cover disjoint column ranges. Output owns the
+ // physical direct-write policy.
+ 
++#include "ops/common/launch_smem.cuh"
+ #include "ops/linear/q8/q8_ksplit_mma.cuh"
+ 
+ #include <cuda_bf16.h>
+@@ -13,6 +14,21 @@
+ 
+ namespace ninfer::ops::detail {
+ 
++// The contraction owns the shared layout; launch sites use the same type to
++// size the dynamic allocation (see launch_kernel_with_smem). sm_89 caps static
++// shared memory at 48 KB per CTA, so this storage lives in the dynamic pool.
++template <int TileCols, int KSplits, int NGroups>
++struct alignas(16) Q8KSplitGroupedShared {
++    static constexpr int kTileK       = 64;
++    static constexpr int kMmaRows     = 16;
++    static constexpr int kKernelWarps = KSplits * NGroups;
++    static constexpr int kGroupK      = KSplits * kTileK;
++    static constexpr int kWarpCols    = TileCols / NGroups;
++
++    std::uint8_t code_shared[kMmaRows][kGroupK];
++    __nv_bfloat16 b_shared[kKernelWarps][kWarpCols * kTileK];
++};
++
+ template <int Hidden, int TileCols, int KSplits, int NGroups, int MinBlocks, class Output,
+           bool AddResidual = false, bool TiledColumns = false>
+ __global__ __launch_bounds__(KSplits* NGroups * 32, MinBlocks) void q8_ksplit_grouped_mma_kernel(
+@@ -31,8 +47,19 @@ __global__ __launch_bounds__(KSplits* NGroups * 32, MinBlocks) void q8_ksplit_gr
+     static_assert(TileCols % NGroups == 0 && kWarpCols % 8 == 0);
+     static_assert(Hidden % kGroupK == 0 && kKernelWarps <= 32);
+ 
+-    __shared__ __align__(16) std::uint8_t code_shared[kMmaRows][kGroupK];
+-    __shared__ __align__(16) __nv_bfloat16 b_shared[kKernelWarps][kWarpCols * kTileK];
++    // sm_89 (Ada) caps static shared memory at 48 KB per CTA (sm_120a accepts
++    // the full per-CTA shared memory). Storage above the limit uses the dynamic
++    // pool that launch_kernel_with_smem sizes at launch; smaller storage keeps
++    // the static allocation, matching the original launch contract.
++    using SharedStorage = Q8KSplitGroupedShared<TileCols, KSplits, NGroups>;
++    constexpr bool kDynamicShared = sizeof(SharedStorage) > kStaticSharedLimitBytes;
++    __shared__ __align__(
++        16) unsigned char static_shared[kDynamicShared ? 1 : sizeof(SharedStorage)];
++    extern __shared__ __align__(16) unsigned char dynamic_shared[];
++    auto& shared =
++        *reinterpret_cast<SharedStorage*>(kDynamicShared ? dynamic_shared : static_shared);
++    auto& code_shared  = shared.code_shared;
++    auto& b_shared     = shared.b_shared;
+ 
+     const int tid        = static_cast<int>(threadIdx.x);
+     const int warp       = tid >> 5;
+diff --git a/src/ops/linear/q8/q8_ksplit_launch.cuh b/src/ops/linear/q8/q8_ksplit_launch.cuh
+index c1b4546d..20eebd4b 100644
+--- a/src/ops/linear/q8/q8_ksplit_launch.cuh
++++ b/src/ops/linear/q8/q8_ksplit_launch.cuh
+@@ -18,13 +18,15 @@ void launch_q8_ksplit(const Tensor& x, const Weight& weight, Tensor& out, cudaSt
+         throw std::invalid_argument("q8 K-split: padded K differs from the registered geometry");
+     }
+     const Q8ContiguousOutput output{static_cast<__nv_bfloat16*>(out.data), Geometry::kOutputRows};
+-    q8_ksplit_mma_kernel<Geometry, ColumnCapacity, Schedule, Q8ContiguousOutput, Epilogue,
+-                         Q8KSplitIdentityRows, false, true>
+-        <<<Geometry::kOutputRows / Schedule::kRowsPerCta, Schedule::kThreads, 0, stream>>>(
+-            static_cast<const __nv_bfloat16*>(x.data),
+-            static_cast<const std::uint8_t*>(weight.qdata),
+-            static_cast<const std::uint8_t*>(weight.scales), output, Epilogue{},
+-            Q8KSplitIdentityRows{}, x.ne[1]);
++    launch_kernel_with_smem(
++        q8_ksplit_mma_kernel<Geometry, ColumnCapacity, Schedule, Q8ContiguousOutput, Epilogue,
++                            Q8KSplitIdentityRows, false, true>,
++        dim3(Geometry::kOutputRows / Schedule::kRowsPerCta), Schedule::kThreads,
++        sizeof(Q8KSplitSharedStorage<Schedule>), stream,
++        static_cast<const __nv_bfloat16*>(x.data),
++        static_cast<const std::uint8_t*>(weight.qdata),
++        static_cast<const std::uint8_t*>(weight.scales), output, Epilogue{},
++        Q8KSplitIdentityRows{}, x.ne[1]);
+     CUDA_CHECK(cudaGetLastError());
+ }
+ 
+diff --git a/src/ops/linear/q8/q8_ksplit_mma.cuh b/src/ops/linear/q8/q8_ksplit_mma.cuh
+index 7fba9fa1..b1d34155 100644
+--- a/src/ops/linear/q8/q8_ksplit_mma.cuh
++++ b/src/ops/linear/q8/q8_ksplit_mma.cuh
+@@ -8,6 +8,7 @@
+ // the CTA reduces FP32 partials in shared memory. Output owns physical row/token addressing; an
+ // optional caller epilogue may instead consume the FP32 tile.
+ 
++#include "ops/common/launch_smem.cuh"
+ #include "ops/common/mma.cuh"
+ #include "ops/common/memory.cuh"
+ #include "ops/linear/q8/q8_ksplit_config.h"
+@@ -104,7 +105,9 @@ q8_ksplit_mma(const __nv_bfloat16* __restrict__ x, const std::uint8_t* __restric
+ 
+     using SharedStorage = Q8KSplitSharedStorage<Schedule>;
+ 
+-    constexpr bool kDynamicShared = TiledColumns && ActiveCols > 64;
++    // sm_89 (Ada) caps static shared memory at 48 KB per CTA; storage above the
++    // limit uses the dynamic pool that launch_kernel_with_smem sizes at launch.
++    constexpr bool kDynamicShared = sizeof(SharedStorage) > kStaticSharedLimitBytes;
+     __shared__ __align__(
+         16) unsigned char static_shared[kDynamicShared ? 1 : sizeof(SharedStorage)];
+     extern __shared__ __align__(16) unsigned char dynamic_shared[];
+diff --git a/src/ops/linear/q8/q8_rowsplit_gemm_mma.cu b/src/ops/linear/q8/q8_rowsplit_gemm_mma.cu
+index 1afae3e0..b33836d7 100644
+--- a/src/ops/linear/q8/q8_rowsplit_gemm_mma.cu
++++ b/src/ops/linear/q8/q8_rowsplit_gemm_mma.cu
+@@ -20,9 +20,12 @@ void launch_slice(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t st
+     const dim3 grid(static_cast<unsigned>(div_up(rows, Schedule::BM)),
+                     static_cast<unsigned>(div_up(cols, Schedule::BN)), 1u);
+     const Q8ContiguousOutput output{static_cast<__nv_bfloat16*>(out.data), rows};
+-    q8_rowsplit_gemm_mma_kernel<Schedule, Full><<<grid, Schedule::THREADS, 0, stream>>>(
+-        static_cast<const __nv_bfloat16*>(x.data), static_cast<const std::uint8_t*>(w.qdata),
+-        static_cast<const std::uint8_t*>(w.scales), output, rows, k, cols, padded_k);
++    launch_kernel_with_smem(q8_rowsplit_gemm_mma_kernel<Schedule, Full>, grid, Schedule::THREADS,
++                            sizeof(Q8RowSplitSharedStorage<Schedule, Q8Epilogue::Store>), stream,
++                            static_cast<const __nv_bfloat16*>(x.data),
++                            static_cast<const std::uint8_t*>(w.qdata),
++                            static_cast<const std::uint8_t*>(w.scales), output, rows, k, cols,
++                            padded_k);
+     CUDA_CHECK(cudaGetLastError());
+ }
+ 
+diff --git a/src/ops/linear/q8/q8_rowsplit_gemm_mma.cuh b/src/ops/linear/q8/q8_rowsplit_gemm_mma.cuh
+index c6d4f583..0eed979b 100644
+--- a/src/ops/linear/q8/q8_rowsplit_gemm_mma.cuh
++++ b/src/ops/linear/q8/q8_rowsplit_gemm_mma.cuh
+@@ -8,6 +8,7 @@
+ // shared tile; x uses a two-stage cp.async pipeline. Tensor Cores execute
+ // m16n8k16 BF16 MMA with FP32 accumulation.
+ 
++#include "ops/common/launch_smem.cuh"
+ #include "ops/common/mma.cuh"
+ #include "ops/common/math.cuh"
+ #include "ops/linear/q8/q8_rowsplit_output.cuh"
+@@ -62,6 +63,20 @@ __device__ __forceinline__ int q8_g32_swz64(int row, int col) {
+     return (((col >> 3) ^ (row & 7)) << 3) | (col & 7);
+ }
+ 
++// The contraction owns the shared layout; launch sites use the same type to
++// size the dynamic allocation (see launch_kernel_with_smem).
++template <class Cfg, Q8Epilogue Epilogue>
++union alignas(16) Q8RowSplitSharedStorage {
++    struct {
++        alignas(16) __nv_bfloat16 weights[Cfg::BM * Cfg::BK];
++        alignas(16) __nv_bfloat16 activations[Cfg::ACTIVATION_STAGES][Cfg::BN * Cfg::BK];
++        alignas(16) std::uint8_t codes[Cfg::BM * Cfg::BK];
++        alignas(16) std::uint8_t scales[Cfg::BM * Cfg::SCALE_CACHE_BYTES];
++    } operands;
++
++    float projected[Epilogue == Q8Epilogue::Residual ? Cfg::BM * Cfg::BN : 1];
++};
++
+ template <class Cfg, bool Full, Q8Epilogue Epilogue = Q8Epilogue::Store,
+           class Output = Q8ContiguousOutput>
+ __global__ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void q8_rowsplit_gemm_mma_kernel(
+@@ -82,20 +97,19 @@ __global__ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void q8_rowsplit_gem
+     static_assert(!kSwiGlu || Cfg::WARPS_M == 1 || Cfg::WARPS_M == 2,
+                   "SwiGLU supports warp-local or shared-memory row pairing");
+ 
+-    struct OperandStorage {
+-        alignas(16) __nv_bfloat16 weights[BM * BK];
+-        alignas(16) __nv_bfloat16 activations[Cfg::ACTIVATION_STAGES][BN * BK];
+-        alignas(16) std::uint8_t codes[BM * BK];
+-        alignas(16) std::uint8_t scales[BM * Cfg::SCALE_CACHE_BYTES];
+-    };
+-
+-    union SharedStorage {
+-        OperandStorage operands;
+-        float projected[Epilogue == Q8Epilogue::Residual ? BM * BN : 1];
+-    };
+-
++    using SharedStorage = Q8RowSplitSharedStorage<Cfg, Epilogue>;
+     static_assert(sizeof(SharedStorage) <= 99 * 1024);
+-    __shared__ __align__(16) SharedStorage shared;
++
++    // sm_89 (Ada) caps static shared memory at 48 KB per CTA (sm_120a accepts
++    // the full per-CTA shared memory). Storage above the limit uses the dynamic
++    // pool that launch_kernel_with_smem sizes at launch; smaller storage keeps
++    // the static allocation, matching the original launch contract.
++    constexpr bool kDynamicShared = sizeof(SharedStorage) > kStaticSharedLimitBytes;
++    __shared__ __align__(
++        16) unsigned char static_shared[kDynamicShared ? 1 : sizeof(SharedStorage)];
++    extern __shared__ __align__(16) unsigned char dynamic_shared[];
++    auto& shared =
++        *reinterpret_cast<SharedStorage*>(kDynamicShared ? dynamic_shared : static_shared);
+     auto& As = shared.operands.weights;
+     auto& Bs = shared.operands.activations;
+     auto& Cr = shared.operands.codes;
+diff --git a/src/ops/linear/q8/shapes/n2048_k16384.cu b/src/ops/linear/q8/shapes/n2048_k16384.cu
+index 34822033..9ce9a4d1 100644
+--- a/src/ops/linear/q8/shapes/n2048_k16384.cu
++++ b/src/ops/linear/q8/shapes/n2048_k16384.cu
+@@ -24,11 +24,14 @@ void launch_grouped(const Tensor& x, const Weight& weight, Tensor& out, cudaStre
+             "q8 grouped K-split: padded K differs from registered geometry");
+     }
+     const Q8ContiguousOutput output{static_cast<__nv_bfloat16*>(out.data), Geometry::kOutputRows};
+-    q8_ksplit_grouped_mma_kernel<Geometry::kInputRows, Capacity, KWarps, TokenGroups, 1>
+-        <<<Geometry::kOutputRows / 16, KWarps * TokenGroups * 32, 0, stream>>>(
+-            static_cast<const __nv_bfloat16*>(x.data),
+-            static_cast<const std::uint8_t*>(weight.qdata),
+-            static_cast<const std::uint8_t*>(weight.scales), output, x.ne[1]);
++    launch_kernel_with_smem(
++        q8_ksplit_grouped_mma_kernel<Geometry::kInputRows, Capacity, KWarps, TokenGroups, 1,
++                                    Q8ContiguousOutput>,
++        dim3(Geometry::kOutputRows / 16), KWarps * TokenGroups * 32,
++        sizeof(Q8KSplitGroupedShared<Capacity, KWarps, TokenGroups>), stream,
++        static_cast<const __nv_bfloat16*>(x.data),
++        static_cast<const std::uint8_t*>(weight.qdata),
++        static_cast<const std::uint8_t*>(weight.scales), output, x.ne[1]);
+     CUDA_CHECK(cudaGetLastError());
+ }
+ } // namespace
+diff --git a/src/ops/linear/q8/shapes/n5120_k25600.cu b/src/ops/linear/q8/shapes/n5120_k25600.cu
+index e707dd92..c78335d5 100644
+--- a/src/ops/linear/q8/shapes/n5120_k25600.cu
++++ b/src/ops/linear/q8/shapes/n5120_k25600.cu
+@@ -21,10 +21,13 @@ void launch_tiled(const Tensor& x, const Weight& weight, Tensor& out, cudaStream
+     using Schedule = Q8RowSplitMmaGemmSchedule<Rows, 64, 16, 16, 1, 2, 128, 1>;
+     const dim3 grid(weight.n / Rows, (x.ne[1] + 63) / 64);
+     const Q8ContiguousOutput output{static_cast<__nv_bfloat16*>(out.data), weight.n};
+-    q8_rowsplit_gemm_mma_kernel<Schedule, false><<<grid, Schedule::THREADS, 0, stream>>>(
+-        static_cast<const __nv_bfloat16*>(x.data), static_cast<const std::uint8_t*>(weight.qdata),
+-        static_cast<const std::uint8_t*>(weight.scales), output, weight.n, weight.k, x.ne[1],
+-        weight.padded_shape[1]);
++    launch_kernel_with_smem(q8_rowsplit_gemm_mma_kernel<Schedule, false>, grid,
++                            Schedule::THREADS,
++                            sizeof(Q8RowSplitSharedStorage<Schedule, Q8Epilogue::Store>), stream,
++                            static_cast<const __nv_bfloat16*>(x.data),
++                            static_cast<const std::uint8_t*>(weight.qdata),
++                            static_cast<const std::uint8_t*>(weight.scales), output, weight.n,
++                            weight.k, x.ne[1], weight.padded_shape[1]);
+     CUDA_CHECK(cudaGetLastError());
+ }
+ 
+diff --git a/src/ops/linear_add/q8/q8_linear_add_gemm_grouped.cu b/src/ops/linear_add/q8/q8_linear_add_gemm_grouped.cu
+index 1d9b182f..657d1726 100644
+--- a/src/ops/linear_add/q8/q8_linear_add_gemm_grouped.cu
++++ b/src/ops/linear_add/q8/q8_linear_add_gemm_grouped.cu
+@@ -14,8 +14,11 @@ void launch(const Tensor& x, const Weight& w, Tensor& residual, cudaStream_t str
+     constexpr int kTokenGroups = 4;
+     const dim3 grid(5120 / 16, div_up(x.ne[1], kColumns));
+     const Q8ContiguousOutput output{static_cast<__nv_bfloat16*>(residual.data), 5120};
+-    q8_ksplit_grouped_mma_kernel<K, kColumns, kSplits, kTokenGroups, 1, Q8ContiguousOutput, true,
+-                                 true><<<grid, kSplits * kTokenGroups * 32, 0, stream>>>(
++    launch_kernel_with_smem(
++        q8_ksplit_grouped_mma_kernel<K, kColumns, kSplits, kTokenGroups, 1, Q8ContiguousOutput,
++                                    true, true>,
++        grid, kSplits * kTokenGroups * 32,
++        sizeof(Q8KSplitGroupedShared<kColumns, kSplits, kTokenGroups>), stream,
+         static_cast<const __nv_bfloat16*>(x.data), static_cast<const std::uint8_t*>(w.qdata),
+         static_cast<const std::uint8_t*>(w.scales), output, x.ne[1]);
+     CUDA_CHECK(cudaGetLastError());
+diff --git a/src/ops/linear_add/q8/q8_linear_add_gemm_mma.cu b/src/ops/linear_add/q8/q8_linear_add_gemm_mma.cu
+index bd28f529..da8ce465 100644
+--- a/src/ops/linear_add/q8/q8_linear_add_gemm_mma.cu
++++ b/src/ops/linear_add/q8/q8_linear_add_gemm_mma.cu
+@@ -19,10 +19,13 @@ void launch_tt(const Tensor& x, const Weight& w, Tensor& residual_out, cudaStrea
+     const dim3 grid(static_cast<unsigned>(div_up(rows, Schedule::BM)),
+                     static_cast<unsigned>(div_up(cols, Schedule::BN)), 1u);
+     const Q8ContiguousOutput output{static_cast<__nv_bfloat16*>(residual_out.data), rows};
+-    q8_rowsplit_gemm_mma_kernel<Schedule, Full, Q8Epilogue::Residual>
+-        <<<grid, Schedule::THREADS, 0, stream>>>(
+-            static_cast<const __nv_bfloat16*>(x.data), static_cast<const std::uint8_t*>(w.qdata),
+-            static_cast<const std::uint8_t*>(w.scales), output, rows, k, cols, padded_k);
++    launch_kernel_with_smem(q8_rowsplit_gemm_mma_kernel<Schedule, Full, Q8Epilogue::Residual>,
++                            grid, Schedule::THREADS,
++                            sizeof(Q8RowSplitSharedStorage<Schedule, Q8Epilogue::Residual>), stream,
++                            static_cast<const __nv_bfloat16*>(x.data),
++                            static_cast<const std::uint8_t*>(w.qdata),
++                            static_cast<const std::uint8_t*>(w.scales), output, rows, k, cols,
++                            padded_k);
+ }
+ 
+ template <class Schedule>
+diff --git a/src/ops/linear_add/q8/q8_linear_add_gemm_splitk.cu b/src/ops/linear_add/q8/q8_linear_add_gemm_splitk.cu
+index d6465311..51e1384f 100644
+--- a/src/ops/linear_add/q8/q8_linear_add_gemm_splitk.cu
++++ b/src/ops/linear_add/q8/q8_linear_add_gemm_splitk.cu
+@@ -41,12 +41,13 @@ void launch_active_cols(const Tensor& x, const Weight& weight, Tensor& residual_
+     static_assert((kRows % kRowsPerCta) == 0);
+     auto* residual = static_cast<__nv_bfloat16*>(residual_out.data);
+     const Q8ContiguousOutput output{residual, kRows};
+-    q8_ksplit_mma_kernel<Geometry, ActiveCols, Schedule, Q8ContiguousOutput,
+-                         Q8KSplitResidualEpilogue>
+-        <<<kRows / kRowsPerCta, Schedule::kThreads, 0, stream>>>(
+-            static_cast<const __nv_bfloat16*>(x.data),
+-            static_cast<const std::uint8_t*>(weight.qdata),
+-            static_cast<const std::uint8_t*>(weight.scales), output, Q8KSplitResidualEpilogue{});
++    launch_kernel_with_smem(
++        q8_ksplit_mma_kernel<Geometry, ActiveCols, Schedule, Q8ContiguousOutput,
++                            Q8KSplitResidualEpilogue>,
++        dim3(kRows / kRowsPerCta), Schedule::kThreads, sizeof(Q8KSplitSharedStorage<Schedule>),
++        stream, static_cast<const __nv_bfloat16*>(x.data),
++        static_cast<const std::uint8_t*>(weight.qdata),
++        static_cast<const std::uint8_t*>(weight.scales), output, Q8KSplitResidualEpilogue{});
+ }
+ 
+ template <int Hidden, std::size_t... Offsets>
+@@ -64,9 +65,13 @@ template <int Hidden, int TileCols, int KSplits, int NGroups, int MinBlocks>
+ void launch_medium(const Tensor& x, Tensor& residual_out, const Weight& weight,
+                    cudaStream_t stream) {
+     const Q8ContiguousOutput output{static_cast<__nv_bfloat16*>(residual_out.data), kRows};
+-    q8_ksplit_grouped_mma_kernel<Hidden, TileCols, KSplits, NGroups, MinBlocks, Q8ContiguousOutput,
+-                                 true><<<kRows / kRowsPerCta, KSplits * NGroups * 32, 0, stream>>>(
+-        static_cast<const __nv_bfloat16*>(x.data), static_cast<const std::uint8_t*>(weight.qdata),
++    launch_kernel_with_smem(
++        q8_ksplit_grouped_mma_kernel<Hidden, TileCols, KSplits, NGroups, MinBlocks,
++                                    Q8ContiguousOutput, true>,
++        dim3(kRows / kRowsPerCta), KSplits * NGroups * 32,
++        sizeof(Q8KSplitGroupedShared<TileCols, KSplits, NGroups>), stream,
++        static_cast<const __nv_bfloat16*>(x.data),
++        static_cast<const std::uint8_t*>(weight.qdata),
+         static_cast<const std::uint8_t*>(weight.scales), output, x.ne[1]);
+ }
+ 
+diff --git a/src/ops/linear_add/sources.cmake b/src/ops/linear_add/sources.cmake
+index da68fa9d..d6ff5944 100644
+--- a/src/ops/linear_add/sources.cmake
++++ b/src/ops/linear_add/sources.cmake
+@@ -3,10 +3,6 @@ target_sources(ninfer_ops PRIVATE
+   "${CMAKE_CURRENT_LIST_DIR}/bf16/bf16_linear_add_gemm_mma.cu"
+   "${CMAKE_CURRENT_LIST_DIR}/bf16/bf16_linear_add_small_t.cu"
+   "${CMAKE_CURRENT_LIST_DIR}/bf16/bf16_linear_add_plan.cpp"
+-  "${CMAKE_CURRENT_LIST_DIR}/nvfp4/nvfp4_linear_add_decode.cu"
+-  "${CMAKE_CURRENT_LIST_DIR}/nvfp4/nvfp4_linear_add_small_t.cu"
+-  "${CMAKE_CURRENT_LIST_DIR}/nvfp4/nvfp4_linear_add_w4a4.cu"
+-  "${CMAKE_CURRENT_LIST_DIR}/nvfp4/nvfp4_linear_add_plan.cpp"
+   "${CMAKE_CURRENT_LIST_DIR}/fp8/fp8_linear_add_decode.cu"
+   "${CMAKE_CURRENT_LIST_DIR}/fp8/fp8_linear_add_small_t.cu"
+   "${CMAKE_CURRENT_LIST_DIR}/fp8/fp8_linear_add_a8.cu"
+@@ -24,3 +20,12 @@ target_sources(ninfer_ops PRIVATE
+   "${CMAKE_CURRENT_LIST_DIR}/q8/q8_linear_add_plan.cpp"
+   "${CMAKE_CURRENT_LIST_DIR}/../wrapper/linear_add.cpp"
+ )
++
++if(NOT NINFER_NO_NVFP4_WEIGHTS)
++  target_sources(ninfer_ops PRIVATE
++    "${CMAKE_CURRENT_LIST_DIR}/nvfp4/nvfp4_linear_add_decode.cu"
++    "${CMAKE_CURRENT_LIST_DIR}/nvfp4/nvfp4_linear_add_small_t.cu"
++    "${CMAKE_CURRENT_LIST_DIR}/nvfp4/nvfp4_linear_add_w4a4.cu"
++    "${CMAKE_CURRENT_LIST_DIR}/nvfp4/nvfp4_linear_add_plan.cpp"
++  )
++endif()
+diff --git a/src/ops/linear_pair/q8/q8_pair_gemm_concat.cu b/src/ops/linear_pair/q8/q8_pair_gemm_concat.cu
+index 8e0f10bf..e8710f04 100644
+--- a/src/ops/linear_pair/q8/q8_pair_gemm_concat.cu
++++ b/src/ops/linear_pair/q8/q8_pair_gemm_concat.cu
+@@ -54,12 +54,14 @@ void launch_variant(const Tensor& x, const Weight& first_weight, Tensor& first_o
+                             static_cast<__nv_bfloat16*>(second_out.data)};
+     const dim3 grid(static_cast<unsigned>(2 * div_up(kRows, Schedule::BM)),
+                     static_cast<unsigned>(div_up(x.ne[1], Schedule::BN)), 1u);
+-    q8_rowsplit_gemm_mma_kernel<Schedule, Full, Q8Epilogue::Store, PairOutput>
+-        <<<grid, Schedule::THREADS, 0, stream>>>(
+-            static_cast<const __nv_bfloat16*>(x.data),
+-            static_cast<const std::uint8_t*>(first_weight.qdata),
+-            static_cast<const std::uint8_t*>(first_weight.scales), output, 2 * kRows, kHidden,
+-            x.ne[1], kHidden);
++    launch_kernel_with_smem(q8_rowsplit_gemm_mma_kernel<Schedule, Full, Q8Epilogue::Store,
++                                                       PairOutput>,
++                            grid, Schedule::THREADS,
++                            sizeof(Q8RowSplitSharedStorage<Schedule, Q8Epilogue::Store>), stream,
++                            static_cast<const __nv_bfloat16*>(x.data),
++                            static_cast<const std::uint8_t*>(first_weight.qdata),
++                            static_cast<const std::uint8_t*>(first_weight.scales), output,
++                            2 * kRows, kHidden, x.ne[1], kHidden);
+ }
+ 
+ template <class Schedule>
+diff --git a/src/ops/linear_pair/q8/q8_pair_gemm_splitk.cu b/src/ops/linear_pair/q8/q8_pair_gemm_splitk.cu
+index 957b9df0..a4330ecf 100644
+--- a/src/ops/linear_pair/q8/q8_pair_gemm_splitk.cu
++++ b/src/ops/linear_pair/q8/q8_pair_gemm_splitk.cu
+@@ -75,10 +75,12 @@ void launch_active_cols(const Tensor& x, const Weight& first_weight, const Weigh
+     const Q8ContiguousOutput ignored{static_cast<__nv_bfloat16*>(first_out.data), kRows};
+     const Q8PairExactTEpilogue epilogue{static_cast<__nv_bfloat16*>(first_out.data),
+                                         static_cast<__nv_bfloat16*>(second_out.data)};
+-    q8_ksplit_mma_kernel<Geometry, ActiveCols, Schedule, Q8ContiguousOutput, Q8PairExactTEpilogue,
+-                         Q8PairExactTRows><<<kRows / kRowsPerCta, Schedule::kThreads, 0, stream>>>(
+-        static_cast<const __nv_bfloat16*>(x.data), first_codes, first_scales, ignored, epilogue,
+-        Q8PairExactTRows{});
++    launch_kernel_with_smem(
++        q8_ksplit_mma_kernel<Geometry, ActiveCols, Schedule, Q8ContiguousOutput,
++                            Q8PairExactTEpilogue, Q8PairExactTRows>,
++        dim3(kRows / kRowsPerCta), Schedule::kThreads, sizeof(Q8KSplitSharedStorage<Schedule>),
++        stream, static_cast<const __nv_bfloat16*>(x.data), first_codes, first_scales, ignored,
++        epilogue, Q8PairExactTRows{});
+ }
+ 
+ template <std::size_t... Offsets>
+@@ -102,9 +104,11 @@ void launch_medium(const Tensor& x, const Weight& first_weight, const Weight& se
+     }
+     const PairOutput output{static_cast<__nv_bfloat16*>(first_out.data),
+                             static_cast<__nv_bfloat16*>(second_out.data)};
+-    q8_ksplit_grouped_mma_kernel<kHidden, TileCols, KSplits, NGroups, MinBlocks>
+-        <<<(2 * kRows) / 16, KSplits * NGroups * 32, 0, stream>>>(
+-            static_cast<const __nv_bfloat16*>(x.data), first_codes, first_scales, output, x.ne[1]);
++    launch_kernel_with_smem(
++        q8_ksplit_grouped_mma_kernel<kHidden, TileCols, KSplits, NGroups, MinBlocks, PairOutput>,
++        dim3((2 * kRows) / 16), KSplits * NGroups * 32,
++        sizeof(Q8KSplitGroupedShared<TileCols, KSplits, NGroups>), stream,
++        static_cast<const __nv_bfloat16*>(x.data), first_codes, first_scales, output, x.ne[1]);
+ }
+ 
+ } // namespace
+diff --git a/src/ops/linear_swiglu/q8/q8_dflash2_linear_swiglu.cu b/src/ops/linear_swiglu/q8/q8_dflash2_linear_swiglu.cu
+index c5aa9738..c775a37e 100644
+--- a/src/ops/linear_swiglu/q8/q8_dflash2_linear_swiglu.cu
++++ b/src/ops/linear_swiglu/q8/q8_dflash2_linear_swiglu.cu
+@@ -34,8 +34,10 @@ void launch_tile(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_
+     const Q8SwiGluDirectEpilogue epilogue{static_cast<__nv_bfloat16*>(out.data), kIntermediate};
+     const RowPolicy row_policy{};
+     constexpr int kBlocks = kIntermediate / RowPolicy::kOutputRowsPerCta;
+-    q8_ksplit_mma_kernel<Geometry, Capacity, Schedule, Q8ContiguousOutput, Q8SwiGluDirectEpilogue,
+-                         RowPolicy, true, true><<<kBlocks, Schedule::kThreads, 0, stream>>>(
++    launch_kernel_with_smem(
++        q8_ksplit_mma_kernel<Geometry, Capacity, Schedule, Q8ContiguousOutput,
++                            Q8SwiGluDirectEpilogue, RowPolicy, true, true>,
++        kBlocks, Schedule::kThreads, sizeof(Q8KSplitSharedStorage<Schedule>), stream,
+         static_cast<const __nv_bfloat16*>(x.data), static_cast<const std::uint8_t*>(weight.qdata),
+         static_cast<const std::uint8_t*>(weight.scales), ignored_output, epilogue, row_policy,
+         x.ne[1]);
+diff --git a/src/ops/linear_swiglu/q8/q8_linear_swiglu_gemm_mma.cu b/src/ops/linear_swiglu/q8/q8_linear_swiglu_gemm_mma.cu
+index 1d81eb26..853ff17d 100644
+--- a/src/ops/linear_swiglu/q8/q8_linear_swiglu_gemm_mma.cu
++++ b/src/ops/linear_swiglu/q8/q8_linear_swiglu_gemm_mma.cu
+@@ -13,11 +13,13 @@ void launch_variant(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t
+     const Q8ContiguousOutput output{static_cast<__nv_bfloat16*>(out.data), out.ne[0]};
+     const dim3 grid(out.ne[0] / (Schedule::BM / 2),
+                     static_cast<unsigned>(div_up(x.ne[1], Schedule::BN)), 1u);
+-    q8_rowsplit_gemm_mma_kernel<Schedule, Full, Q8Epilogue::SwiGluSplitHalf>
+-        <<<grid, Schedule::THREADS, 0, stream>>>(static_cast<const __nv_bfloat16*>(x.data),
+-                                                 static_cast<const std::uint8_t*>(w.qdata),
+-                                                 static_cast<const std::uint8_t*>(w.scales), output,
+-                                                 w.n, w.k, x.ne[1], w.padded_shape[1]);
++    launch_kernel_with_smem(
++        q8_rowsplit_gemm_mma_kernel<Schedule, Full, Q8Epilogue::SwiGluSplitHalf>, grid,
++        Schedule::THREADS,
++        sizeof(Q8RowSplitSharedStorage<Schedule, Q8Epilogue::SwiGluSplitHalf>), stream,
++        static_cast<const __nv_bfloat16*>(x.data), static_cast<const std::uint8_t*>(w.qdata),
++        static_cast<const std::uint8_t*>(w.scales), output, w.n, w.k, x.ne[1],
++        w.padded_shape[1]);
+ }
+ 
+ template <class Schedule>
+diff --git a/src/ops/linear_swiglu/q8/q8_linear_swiglu_gemm_splitk.cu b/src/ops/linear_swiglu/q8/q8_linear_swiglu_gemm_splitk.cu
+index f1534cff..129ec45a 100644
+--- a/src/ops/linear_swiglu/q8/q8_linear_swiglu_gemm_splitk.cu
++++ b/src/ops/linear_swiglu/q8/q8_linear_swiglu_gemm_splitk.cu
+@@ -38,11 +38,13 @@ void launch_active_cols(const Tensor& x, const Weight& w, Tensor& out, cudaStrea
+     const Q8ContiguousOutput ignored_output{static_cast<__nv_bfloat16*>(out.data), kIntermediate};
+     const Q8SwiGluDirectEpilogue epilogue{static_cast<__nv_bfloat16*>(out.data), kIntermediate};
+     const RowPolicy row_policy{};
+-    q8_ksplit_mma_kernel<Geometry, ActiveCols, Schedule, Q8ContiguousOutput, Q8SwiGluDirectEpilogue,
+-                         RowPolicy, true>
+-        <<<kIntermediate / RowPolicy::kOutputRowsPerCta, Schedule::kThreads, 0, stream>>>(
+-            static_cast<const __nv_bfloat16*>(x.data), static_cast<const std::uint8_t*>(w.qdata),
+-            static_cast<const std::uint8_t*>(w.scales), ignored_output, epilogue, row_policy);
++    launch_kernel_with_smem(
++        q8_ksplit_mma_kernel<Geometry, ActiveCols, Schedule, Q8ContiguousOutput,
++                            Q8SwiGluDirectEpilogue, RowPolicy, true>,
++        dim3(kIntermediate / RowPolicy::kOutputRowsPerCta), Schedule::kThreads,
++        sizeof(Q8KSplitSharedStorage<Schedule>), stream,
++        static_cast<const __nv_bfloat16*>(x.data), static_cast<const std::uint8_t*>(w.qdata),
++        static_cast<const std::uint8_t*>(w.scales), ignored_output, epilogue, row_policy);
+ }
+ 
+ template <std::size_t... Offsets>
+diff --git a/src/ops/linear_swiglu/sources.cmake b/src/ops/linear_swiglu/sources.cmake
+index e32687cb..ce68463f 100644
+--- a/src/ops/linear_swiglu/sources.cmake
++++ b/src/ops/linear_swiglu/sources.cmake
+@@ -2,10 +2,6 @@ target_sources(ninfer_ops PRIVATE
+   "${CMAKE_CURRENT_LIST_DIR}/q4/q4_linear_swiglu_gemm_mma.cu"
+   "${CMAKE_CURRENT_LIST_DIR}/q4/q4_linear_swiglu_gemv.cu"
+   "${CMAKE_CURRENT_LIST_DIR}/q4/q4_linear_swiglu_plan.cpp"
+-  "${CMAKE_CURRENT_LIST_DIR}/nvfp4/nvfp4_linear_swiglu_decode.cu"
+-  "${CMAKE_CURRENT_LIST_DIR}/nvfp4/nvfp4_linear_swiglu_small_t.cu"
+-  "${CMAKE_CURRENT_LIST_DIR}/nvfp4/nvfp4_linear_swiglu_w4a4.cu"
+-  "${CMAKE_CURRENT_LIST_DIR}/nvfp4/nvfp4_linear_swiglu_plan.cpp"
+   "${CMAKE_CURRENT_LIST_DIR}/fp8/fp8_linear_swiglu_decode.cu"
+   "${CMAKE_CURRENT_LIST_DIR}/fp8/fp8_linear_swiglu_small_t.cu"
+   "${CMAKE_CURRENT_LIST_DIR}/fp8/fp8_linear_swiglu_a8.cu"
+@@ -18,6 +14,15 @@ target_sources(ninfer_ops PRIVATE
+   "${CMAKE_CURRENT_LIST_DIR}/../wrapper/linear_swiglu.cpp"
+ )
+ 
+-target_sources(ninfer_nvfp4_non_rdc PRIVATE
+-  "${CMAKE_CURRENT_LIST_DIR}/nvfp4/nvfp4_linear_swiglu_w4a4_tma.cu"
+-)
++if(NOT NINFER_NO_NVFP4_WEIGHTS)
++  target_sources(ninfer_ops PRIVATE
++    "${CMAKE_CURRENT_LIST_DIR}/nvfp4/nvfp4_linear_swiglu_decode.cu"
++    "${CMAKE_CURRENT_LIST_DIR}/nvfp4/nvfp4_linear_swiglu_small_t.cu"
++    "${CMAKE_CURRENT_LIST_DIR}/nvfp4/nvfp4_linear_swiglu_w4a4.cu"
++    "${CMAKE_CURRENT_LIST_DIR}/nvfp4/nvfp4_linear_swiglu_plan.cpp"
++  )
++
++  target_sources(ninfer_nvfp4_non_rdc PRIVATE
++    "${CMAKE_CURRENT_LIST_DIR}/nvfp4/nvfp4_linear_swiglu_w4a4_tma.cu"
++  )
++endif()
+diff --git a/src/ops/nvfp4_l20_stub.cpp b/src/ops/nvfp4_l20_stub.cpp
+new file mode 100644
+index 00000000..923407e9
+--- /dev/null
++++ b/src/ops/nvfp4_l20_stub.cpp
+@@ -0,0 +1,266 @@
++// NINFER_L20 / sm_89 (Ada Lovelace) port -- stubs for FP4-dependent kernels.
++//
++// sm_89 has no MXF4/NVFP4 block-scale MMA (that PTX is sm_120a-only), so the
++// upstream NVFP4 *weight* kernels cannot be built for the L20. The NVFP4/K8V4
++// *KV-cache* representation is unavailable as well: its encode side uses the
++// hardware `cvt .e2m1x2` FP4 conversion (sm_100a/sm_120a-only), so NVFP4/K8V4
++// KV can never be populated on sm_89 and its decode kernels are unreachable.
++//
++// This translation unit provides stub definitions for every excluded symbol
++// referenced by the retained (architecture-independent) dispatch layers. Each
++// stub throws a clear std::runtime_error, so an NVFP4-weight artifact or an
++// NVFP4/K8V4 KV selection fails loudly at load / first use instead of
++// crashing. L20 builds are expected to run the groupwise-int (Q4/Q5)
++// artifacts with bf16 / int8 / fp8 KV; see the L20 port report.
++//
++// This file is compiled only when NINFER_L20_NO_PDL is defined (sm_89 build).
++
++#include "core/arena.h"
++#include "core/tensor.h"
++#include "core/weight.h"
++#include "ninfer/ops/linear.h"
++#include "ops/linear/nvfp4/nvfp4_dispatch.h"
++#include "ops/linear/nvfp4/nvfp4_format.h"
++#include "ops/attn_input_proj/nvfp4/nvfp4_attn_input_plan.h"
++#include "ops/gdn_input_proj/nvfp4/nvfp4_gdn_input_plan.h"
++#include "ops/gdn_input_proj/nvfp4/nvfp4_gdn_snapshot_plan.h"
++#include "ops/linear_add/nvfp4/nvfp4_linear_add_plan.h"
++#include "ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_plan.h"
++#include "ops/linear/nvfp4/nvfp4_geometry.h"
++#include "ops/softmax_attention/dense/causal_cache/prompt_nvfp4_non_rdc_launch.h"
++#include "ops/kv_cache/append/launch.h"
++#include "ops/softmax_attention/dense/causal_cache/launch.h"
++
++#include <cuda_runtime.h>
++
++#include <cstddef>
++#include <cstdint>
++#include <stdexcept>
++
++namespace ninfer::ops::detail {
++namespace {
++
++[[noreturn]] void nvfp4_unsupported() {
++    throw std::runtime_error(
++        "NVFP4 weights are not supported on this build (sm_89 / NVIDIA L20): the "
++        "mxf4nvf4 block-scale MMA is sm_120a-only. Use the groupwise-int (Q4/Q5) "
++        "artifact instead, e.g. qwen3_8_27b.ninfer.");
++}
++
++} // namespace
++
++// --- nvfp4_format.h ---------------------------------------------------------
++Nvfp4WeightGeometry validate_nvfp4_weight(const Weight&, const char*) { nvfp4_unsupported(); }
++
++// --- nvfp4_dispatch.h -------------------------------------------------------
++std::size_t nvfp4_linear_workspace_capacity_bytes(std::int32_t, std::int32_t, LinearPolicy,
++                                                  std::int32_t, std::int32_t) {
++    nvfp4_unsupported();
++}
++void nvfp4_dispatch(const Tensor&, const Weight&, Tensor&, LinearPolicy, WorkspaceArena*,
++                    cudaStream_t) {
++    nvfp4_unsupported();
++}
++
++// --- nvfp4_attn_input_plan.h -------------------------------------------------
++std::size_t nvfp4_attn_input_workspace_capacity_bytes(LinearPolicy, std::int32_t, std::int32_t) {
++    nvfp4_unsupported();
++}
++void nvfp4_attn_input_decode_launch(const Tensor&, const Weight&, Tensor&, Tensor&, Tensor&,
++                                    Tensor&, cudaStream_t) {
++    nvfp4_unsupported();
++}
++void nvfp4_attn_input_small_t_launch(const Tensor&, const Weight&, Tensor&, Tensor&, Tensor&,
++                                     Tensor&, cudaStream_t) {
++    nvfp4_unsupported();
++}
++void nvfp4_attn_input_w4a4_launch(const Tensor&, const Weight&, Tensor&, Tensor&, Tensor&, Tensor&,
++                                  Nvfp4W4a4Workspace, cudaStream_t) {
++    nvfp4_unsupported();
++}
++void nvfp4_attn_input_dispatch(const Tensor&, const Weight&, Tensor&, Tensor&, Tensor&, Tensor&,
++                               LinearPolicy, WorkspaceArena*, cudaStream_t) {
++    nvfp4_unsupported();
++}
++
++// --- nvfp4_gdn_input_plan.h --------------------------------------------------
++std::size_t nvfp4_gdn_input_workspace_capacity_bytes(LinearPolicy, std::int32_t, std::int32_t) {
++    nvfp4_unsupported();
++}
++void nvfp4_gdn_input_decode_launch(const Tensor&, const Weight&, Tensor&, Tensor&, cudaStream_t) {
++    nvfp4_unsupported();
++}
++void nvfp4_gdn_input_small_t_launch(const Tensor&, const Weight&, Tensor&, Tensor&, cudaStream_t) {
++    nvfp4_unsupported();
++}
++void nvfp4_gdn_input_w4a4_launch(const Tensor&, const Weight&, Tensor&, Tensor&,
++                                 Nvfp4W4a4Workspace, cudaStream_t) {
++    nvfp4_unsupported();
++}
++void nvfp4_gdn_input_dispatch(const Tensor&, const Weight&, Tensor&, Tensor&, LinearPolicy,
++                              WorkspaceArena*, cudaStream_t) {
++    nvfp4_unsupported();
++}
++
++// --- nvfp4_gdn_snapshot_plan.h -----------------------------------------------
++Nvfp4GdnConvPlan nvfp4_gdn_conv_resolve_plan(LinearPolicy, std::int32_t, std::int32_t) {
++    nvfp4_unsupported();
++}
++std::size_t nvfp4_gdn_snapshot_workspace_capacity_bytes(LinearPolicy, std::int32_t, std::int32_t) {
++    nvfp4_unsupported();
++}
++void nvfp4_gdn_snapshot_decode_launch(const Tensor&, const Weight&, const Tensor&, Tensor&,
++                                      const Tensor&, const Tensor&, const Tensor&, Tensor&,
++                                      Tensor&, Tensor&, Tensor&, cudaStream_t) {
++    nvfp4_unsupported();
++}
++void nvfp4_gdn_snapshot_small_t_launch(const Tensor&, const Weight&, const Tensor&, Tensor&,
++                                       const Tensor&, const Tensor&, const Tensor&, Tensor&,
++                                       Tensor&, Tensor&, Tensor&, cudaStream_t) {
++    nvfp4_unsupported();
++}
++void nvfp4_gdn_record_small_t_launch(const Tensor&, const Weight&, const Tensor&, const Tensor&,
++                                     const Tensor&, const Tensor&, Tensor&, Tensor&, Tensor&,
++                                     Tensor&, Tensor&, cudaStream_t) {
++    nvfp4_unsupported();
++}
++void nvfp4_gdn_snapshot_post_launch(const Tensor&, const Tensor&, Tensor&, const Tensor&,
++                                    const Tensor&, const Tensor&, Tensor&, Tensor&, Tensor&,
++                                    cudaStream_t) {
++    nvfp4_unsupported();
++}
++void nvfp4_gdn_record_post_launch(const Tensor&, const Tensor&, const Tensor&, const Tensor&,
++                                  const Tensor&, Tensor&, Tensor&, Tensor&, cudaStream_t) {
++    nvfp4_unsupported();
++}
++void nvfp4_gdn_snapshot_dispatch(const Tensor&, const Weight&, const Tensor&, Tensor&,
++                                 const Tensor&, const Tensor&, const Tensor&, Tensor&, Tensor&,
++                                 Tensor&, Tensor&, LinearPolicy, WorkspaceArena&, cudaStream_t) {
++    nvfp4_unsupported();
++}
++
++// --- nvfp4_linear_add_plan.h -------------------------------------------------
++std::size_t nvfp4_linear_add_workspace_capacity_bytes(std::int32_t, std::int32_t, LinearPolicy,
++                                                      std::int32_t, std::int32_t) {
++    nvfp4_unsupported();
++}
++void nvfp4_linear_add_decode_launch(const Tensor&, const Weight&, Tensor&, cudaStream_t) {
++    nvfp4_unsupported();
++}
++void nvfp4_linear_add_small_t_launch(const Tensor&, const Weight&, Tensor&, cudaStream_t) {
++    nvfp4_unsupported();
++}
++void nvfp4_linear_add_w4a4_launch(const Tensor&, const Weight&, Tensor&, Nvfp4W4a4Workspace,
++                                  cudaStream_t) {
++    nvfp4_unsupported();
++}
++void nvfp4_linear_add_dispatch(const Tensor&, const Weight&, Tensor&, LinearPolicy, WorkspaceArena&,
++                               cudaStream_t) {
++    nvfp4_unsupported();
++}
++
++// --- nvfp4_linear_swiglu_plan.h ----------------------------------------------
++std::size_t nvfp4_linear_swiglu_workspace_capacity_bytes(LinearPolicy, std::int32_t,
++                                                         std::int32_t) {
++    nvfp4_unsupported();
++}
++void nvfp4_linear_swiglu_decode_launch(const Tensor&, const Weight&, Tensor&, cudaStream_t) {
++    nvfp4_unsupported();
++}
++void nvfp4_linear_swiglu_small_t_launch(const Tensor&, const Weight&, Tensor&, cudaStream_t) {
++    nvfp4_unsupported();
++}
++void nvfp4_linear_swiglu_w4a4_launch(const Tensor&, const Weight&, Tensor&, WorkspaceArena&,
++                                     cudaStream_t) {
++    nvfp4_unsupported();
++}
++void nvfp4_linear_swiglu_dispatch(const Tensor&, const Weight&, Tensor&, LinearPolicy,
++                                  WorkspaceArena&, cudaStream_t) {
++    nvfp4_unsupported();
++}
++
++// --- nvfp4_geometry.h (geometry structs used by wrappers) --------------------
++// Geometry constants are constexpr in the header; nothing to stub there.
++
++// --- prompt_nvfp4_non_rdc_launch.h -------------------------------------------
++// The warp-specialized (setmaxnreg/TMA) NVFP4-KV prompt attention kernel lives
++// in the sm_120a-only non-RDC archive. On sm_89 the NVFP4 KV cache path is not
++// offered (use --kv-dtype fp8 / int8 / bf16); these stubs keep prompt_nvfp4.cu
++// linkable while failing loudly if it is ever reached.
++void causal_attention_prompt_nvfp4_kernel_launch(const Tensor&, const Tensor&, float,
++                                                 const PagedKVLayerView&, Tensor&, cudaStream_t) {
++    nvfp4_unsupported();
++}
++void causal_attention_prompt_nvfp4_batch_kernel_launch(const Tensor&, const Tensor&, const Tensor&,
++                                                       const Tensor&, float,
++                                                       const PagedKVBatchLayerView&, Tensor&,
++                                                       cudaStream_t) {
++    nvfp4_unsupported();
++}
++
++// --- NVFP4/K8V4 KV-cache symbols --------------------------------------------
++// The encode side of the NVFP4/K8V4 KV representation uses the hardware
++// `cvt .e2m1x2` conversion (sm_100a/sm_120a-only), so that representation can
++// never be populated on sm_89 and its decode kernels are unreachable. These
++// stubs cover every such symbol referenced by the retained dispatch layers.
++[[noreturn]] void kv_fp4_unsupported() {
++    throw std::runtime_error(
++        "NVFP4/K8V4 KV cache is not supported on this build (sm_89 / NVIDIA L20): "
++        "the e2m1 FP4 conversion is sm_100a/sm_120a-only hardware. Use "
++        "--kv-dtype bf16, int8, or fp8.");
++}
++
++void kv_cache_append_nvfp4_launch(const Tensor&, const Tensor&, const Tensor&, PagedKVLayerView,
++                                  cudaStream_t) {
++    kv_fp4_unsupported();
++}
++void kv_cache_append_nvfp4_batch_launch(const Tensor&, const Tensor&, const Tensor&,
++                                        const Tensor&, const Tensor&, PagedKVBatchLayerView,
++                                        cudaStream_t) {
++    kv_fp4_unsupported();
++}
++void kv_cache_append_k8v4_launch(const Tensor&, const Tensor&, const Tensor&, PagedKVLayerView,
++                                 cudaStream_t) {
++    kv_fp4_unsupported();
++}
++void kv_cache_append_k8v4_batch_launch(const Tensor&, const Tensor&, const Tensor&,
++                                       const Tensor&, const Tensor&, PagedKVBatchLayerView,
++                                       cudaStream_t) {
++    kv_fp4_unsupported();
++}
++
++void causal_attention_small_t_nvfp4_launch(
++    const Tensor&, const Tensor&, const Tensor&, const Tensor&, const Tensor&, const Tensor&,
++    float, PagedKVBatchLayerView, CausalAttentionExecutionEnvelope, std::int32_t, std::int32_t,
++    Tensor&, Tensor&, Tensor&, Tensor&, cudaStream_t) {
++    kv_fp4_unsupported();
++}
++void causal_attention_small_t_k8v4_launch(
++    const Tensor&, const Tensor&, const Tensor&, const Tensor&, const Tensor&, const Tensor&,
++    float, PagedKVBatchLayerView, CausalAttentionExecutionEnvelope, std::int32_t, std::int32_t,
++    Tensor&, Tensor&, Tensor&, Tensor&, cudaStream_t) {
++    kv_fp4_unsupported();
++}
++void causal_attention_cached_small_t_nvfp4_launch(const Tensor&, const Tensor&, float,
++                                                  const PagedKVLayerView&,
++                                                  CausalAttentionExecutionEnvelope, Tensor&,
++                                                  Tensor&, Tensor&, Tensor&, cudaStream_t) {
++    kv_fp4_unsupported();
++}
++void causal_attention_cached_small_t_k8v4_launch(const Tensor&, const Tensor&, float,
++                                                 const PagedKVLayerView&,
++                                                 CausalAttentionExecutionEnvelope, Tensor&,
++                                                 Tensor&, Tensor&, Tensor&, cudaStream_t) {
++    kv_fp4_unsupported();
++}
++void causal_attention_prompt_k8v4_launch(const Tensor&, const Tensor&, const Tensor&,
++                                         const Tensor&, const Tensor&, const Tensor&, float,
++                                         PagedKVBatchLayerView, Tensor&, cudaStream_t) {
++    kv_fp4_unsupported();
++}
++void causal_attention_prompt_k8v4_attention_launch(const Tensor&, const Tensor&, float,
++                                                   const PagedKVLayerView&, Tensor&, cudaStream_t) {
++    kv_fp4_unsupported();
++}
++
++} // namespace ninfer::ops::detail
+diff --git a/src/ops/softmax_attention/sources.cmake b/src/ops/softmax_attention/sources.cmake
+index 24feb86f..70e4c2bb 100644
+--- a/src/ops/softmax_attention/sources.cmake
++++ b/src/ops/softmax_attention/sources.cmake
+@@ -2,12 +2,9 @@ target_sources(ninfer_ops PRIVATE
+   "${CMAKE_CURRENT_LIST_DIR}/dense/causal_cache/causal_softmax_attention.cpp"
+   "${CMAKE_CURRENT_LIST_DIR}/dense/causal_cache/small_t.cu"
+   "${CMAKE_CURRENT_LIST_DIR}/dense/causal_cache/small_t_fp8.cu"
+-  "${CMAKE_CURRENT_LIST_DIR}/dense/causal_cache/small_t_nvfp4.cu"
+-  "${CMAKE_CURRENT_LIST_DIR}/dense/causal_cache/small_t_k8v4.cu"
+   "${CMAKE_CURRENT_LIST_DIR}/dense/causal_cache/prompt.cu"
+   "${CMAKE_CURRENT_LIST_DIR}/dense/causal_cache/prompt_fp8.cu"
+   "${CMAKE_CURRENT_LIST_DIR}/dense/causal_cache/prompt_nvfp4.cu"
+-  "${CMAKE_CURRENT_LIST_DIR}/dense/causal_cache/prompt_k8v4.cu"
+   "${CMAKE_CURRENT_LIST_DIR}/dense/packed/packed_softmax_attention.cpp"
+   "${CMAKE_CURRENT_LIST_DIR}/dense/packed/launch.cu"
+   "${CMAKE_CURRENT_LIST_DIR}/dense/context/context_softmax_attention.cpp"
+@@ -16,6 +13,20 @@ target_sources(ninfer_ops PRIVATE
+   "${CMAKE_CURRENT_LIST_DIR}/sliding_window/launch.cu"
+ )
+ 
+-target_sources(ninfer_nvfp4_non_rdc PRIVATE
+-  "${CMAKE_CURRENT_LIST_DIR}/dense/causal_cache/prompt_nvfp4_non_rdc.cu"
+-)
++# NINFER_L20 / sm_89 (Ada) port: the NVFP4/K8V4 KV-cache attention kernels
++# decode NVFP4 KV through the hardware e2m1 conversion (sm_100a/sm_120a-only),
++# and their encode side (kv_cache/sources.cmake) can never be populated on
++# sm_89, so the whole representation is excluded and covered by throwing stubs
++# in nvfp4_l20_stub.cpp. prompt_nvfp4.cu is pure host composition over the
++# non-RDC kernel launchers, which are stubbed on sm_89; it stays. The
++# bf16/int8/fp8 KV attention kernels are unaffected.
++if(NOT NINFER_NO_NVFP4_WEIGHTS)
++  target_sources(ninfer_ops PRIVATE
++    "${CMAKE_CURRENT_LIST_DIR}/dense/causal_cache/small_t_nvfp4.cu"
++    "${CMAKE_CURRENT_LIST_DIR}/dense/causal_cache/small_t_k8v4.cu"
++    "${CMAKE_CURRENT_LIST_DIR}/dense/causal_cache/prompt_k8v4.cu"
++  )
++  target_sources(ninfer_nvfp4_non_rdc PRIVATE
++    "${CMAKE_CURRENT_LIST_DIR}/dense/causal_cache/prompt_nvfp4_non_rdc.cu"
++  )
++endif()

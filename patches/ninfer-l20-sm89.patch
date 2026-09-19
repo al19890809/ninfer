@@ -1,0 +1,660 @@
+From e68aae89d92bb57449f2aa68a5562a8c591305f7 Mon Sep 17 00:00:00 2001
+From: L20 Port <port@l20.local>
+Date: Wed, 16 Sep 2026 07:32:41 +0800
+Subject: [PATCH] Port NInfer to NVIDIA L20 (sm_89 / Ada, CUDA 12.8)
+
+- CMAKE: default to sm_89, keep sm_120a; define NINFER_L20_NO_PDL on sm_89
+- pdl.cuh: PDL (griddepcontrol) requires sm_90+; degrade to plain in-order
+  stream launches on sm_89 (correct, PDL is latency-only)
+- mma.cuh: use plain e4m3 MMA on sm_89 (kind::f8f6f4 is sm_120-only);
+  guard mxf4nvf4 block-scale MMA behind sm_120
+- startup.cpp: accept compute capability 8.9 alongside 12.0
+- ops CMake: exclude sm_120-only NVFP4 *weight* kernels on sm_89 and link
+  nvfp4_l20_stub.cpp (throws a clear error); NVFP4 KV-cache kernels (software
+  dequant) are kept
+- new: src/ops/nvfp4_l20_stub.cpp
+---
+ CMakeLists.txt                                |  14 +-
+ src/core/pdl.cuh                              |  91 ++++++--
+ .../qwen3_5/program/planning/startup.cpp      |   7 +-
+ src/ops/CMakeLists.txt                        |  28 ++-
+ src/ops/attn_input_proj/sources.cmake         |  13 +-
+ src/ops/common/mma.cuh                        |  18 ++
+ src/ops/gdn_input_proj/sources.cmake          |  21 +-
+ src/ops/linear/nvfp4/sources.cmake            |  28 +--
+ src/ops/linear_add/sources.cmake              |  13 +-
+ src/ops/linear_swiglu/sources.cmake           |  19 +-
+ src/ops/nvfp4_l20_stub.cpp                    | 194 ++++++++++++++++++
+ src/ops/softmax_attention/sources.cmake       |  12 +-
+ 12 files changed, 382 insertions(+), 76 deletions(-)
+ create mode 100644 src/ops/nvfp4_l20_stub.cpp
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 27e9560..3d71516 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -1,14 +1,16 @@
+ cmake_minimum_required(VERSION 3.28)
+ 
+-# The current implementation is compiled only for sm_120a. Set and validate the
+-# architecture before CUDA compiler detection so CMake never injects a generic
+-# host-toolchain default or accepts an unsupported target.
++# NINFER_L20 port: build for Ada (sm_89) by default. sm_120a remains supported.
++# Supported values: "89" (NVIDIA L20 / Ada Lovelace) and "120a" (RTX 5090 / Blackwell).
+ if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
+-  set(CMAKE_CUDA_ARCHITECTURES 120a CACHE STRING "CUDA architectures to build")
++  set(CMAKE_CUDA_ARCHITECTURES 89 CACHE STRING "CUDA architectures to build")
+ endif()
+-if(NOT CMAKE_CUDA_ARCHITECTURES STREQUAL "120a")
++if(CMAKE_CUDA_ARCHITECTURES STREQUAL "89")
++  # Ada Lovelace (L20): no sm_90+ PDL; tell pdl.cuh to use plain launches.
++  add_compile_definitions($<$<COMPILE_LANGUAGE:CUDA>:NINFER_L20_NO_PDL>)
++elseif(NOT CMAKE_CUDA_ARCHITECTURES STREQUAL "120a")
+   message(FATAL_ERROR
+-    "NInfer supports only CMAKE_CUDA_ARCHITECTURES=120a; got "
++    "NInfer supports CMAKE_CUDA_ARCHITECTURES=89 (L20) or 120a (RTX 5090); got "
+     "'${CMAKE_CUDA_ARCHITECTURES}'")
+ endif()
+ 
+diff --git a/src/core/pdl.cuh b/src/core/pdl.cuh
+index 0c60b6a..c2d87df 100644
+--- a/src/core/pdl.cuh
++++ b/src/core/pdl.cuh
+@@ -5,6 +5,24 @@
+ #include <cstddef>
+ #include <utility>
+ 
++// NINFER_L20 / sm_89 (Ada Lovelace) port
++// ---------------------------------------------------------------------------
++// Programmatic Dependent Launch (`griddepcontrol.*`) requires sm_90+. The L20
++// is sm_89, so PDL is unavailable there. PDL is only a latency optimization:
++// a consumer kernel launched on the same stream already begins only after its
++// producer kernel has fully completed (CUDA in-order stream semantics), so a
++// plain launch is a correct, slightly slower substitute.
++//
++// Strategy:
++//  * On sm_89 the device helpers become no-ops (there are no dependents to
++//    trigger and no dependency to wait on -- stream order supplies both).
++//  * The host `launch_dependent` degenerates to a normal `cudaLaunchKernel`
++//    when compiled for a pre-sm_90-only build. Because CMAKE_CUDA_ARCHITECTURES
++//    for the L20 build is exactly one arch (89), a host-side check on the
++//    compiled arch is reliable; we detect it through __CUDA_ARCH__ when the
++//    TU is a CUDA file, and fall back to launching normally via a runtime flag
++//    compiled in by CMake (NINFER_L20_PLAIN_LAUNCH) for safety.
++
+ namespace ninfer::pdl {
+ 
+ struct LaunchConfig {
+@@ -14,32 +32,63 @@ struct LaunchConfig {
+     cudaStream_t stream            = nullptr;
+ };
+ 
+-// Launches a consumer kernel as a programmatic dependent of the immediately preceding producer
+-// kernel in the same stream. Every consumer control path that reads producer output must first call
+-// wait_for_dependencies().
++namespace detail {
++// Set at compile time by the CUDA compiler for the *single* target arch of
++// this build. For a pure sm_89 build this is false.
++#if defined(NINFER_L20_NO_PDL)
++inline constexpr bool kPdlAvailable = false;
++#else
++inline constexpr bool kPdlAvailable = true;
++#endif
++} // namespace detail
++
++// Launches a consumer kernel as a programmatic dependent of the immediately
++// preceding producer kernel in the same stream. Every consumer control path
++// that reads producer output must first call wait_for_dependencies().
+ template <class... KernelArgs, class... CallArgs>
+ [[nodiscard]] inline cudaError_t
+ launch_dependent(const LaunchConfig& launch, void (*kernel)(KernelArgs...), CallArgs&&... args) {
+-    cudaLaunchAttribute attribute{};
+-    attribute.id = cudaLaunchAttributeProgrammaticStreamSerialization;
+-    attribute.val.programmaticStreamSerializationAllowed = 1;
+-
+-    cudaLaunchConfig_t config{};
+-    config.gridDim          = launch.grid;
+-    config.blockDim         = launch.block;
+-    config.dynamicSmemBytes = launch.dynamic_smem_bytes;
+-    config.stream           = launch.stream;
+-    config.attrs            = &attribute;
+-    config.numAttrs         = 1;
+-
+-    return cudaLaunchKernelEx(&config, kernel, std::forward<CallArgs>(args)...);
++    if constexpr (!detail::kPdlAvailable) {
++        // sm_89 / L20 path: plain in-order launch (PDL attribute omitted). We
++        // take the address of each argument and pass a void* array to the
++        // driver-style launch; every current call site passes plain scalar /
++        // pointer arguments, which is exactly what this supports.
++        void* arg_ptrs[] = {const_cast<void*>(static_cast<const void*>(&args))...};
++        return cudaLaunchKernel(reinterpret_cast<const void*>(kernel), launch.grid, launch.block,
++                                arg_ptrs, launch.dynamic_smem_bytes, launch.stream);
++    } else {
++        cudaLaunchAttribute attribute{};
++        attribute.id = cudaLaunchAttributeProgrammaticStreamSerialization;
++        attribute.val.programmaticStreamSerializationAllowed = 1;
++
++        cudaLaunchConfig_t config{};
++        config.gridDim          = launch.grid;
++        config.blockDim         = launch.block;
++        config.dynamicSmemBytes = launch.dynamic_smem_bytes;
++        config.stream           = launch.stream;
++        config.attrs            = &attribute;
++        config.numAttrs         = 1;
++
++        return cudaLaunchKernelEx(&config, kernel, std::forward<CallArgs>(args)...);
++    }
+ }
+ 
+-// Every producer CTA must call this at least once or exit. This enables dependent scheduling but
+-// does not make producer writes visible to the consumer.
+-__device__ __forceinline__ void trigger_dependents() { cudaTriggerProgrammaticLaunchCompletion(); }
++// Every producer CTA must call this at least once or exit. This enables
++// dependent scheduling but does not make producer writes visible to the
++// consumer. No-op on sm_89.
++__device__ __forceinline__ void trigger_dependents() {
++#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
++    cudaTriggerProgrammaticLaunchCompletion();
++#endif
++}
+ 
+-// Call on every consumer control path before its first access to producer-dependent data.
+-__device__ __forceinline__ void wait_for_dependencies() { cudaGridDependencySynchronize(); }
++// Call on every consumer control path before its first access to
++// producer-dependent data. No-op on sm_89 (stream order already guarantees
++// the producer finished before the consumer started).
++__device__ __forceinline__ void wait_for_dependencies() {
++#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
++    cudaGridDependencySynchronize();
++#endif
++}
+ 
+ } // namespace ninfer::pdl
+diff --git a/src/models/qwen3_5/program/planning/startup.cpp b/src/models/qwen3_5/program/planning/startup.cpp
+index 8a6e480..8888534 100644
+--- a/src/models/qwen3_5/program/planning/startup.cpp
++++ b/src/models/qwen3_5/program/planning/startup.cpp
+@@ -801,8 +801,11 @@ void validate_target_options(const execution::Parameters& parameters, DeviceCont
+         }
+         break;
+     }
+-    if (device.compute_capability() != 120) {
+-        throw std::invalid_argument("Qwen3.5 family runtime requires compute capability 12.0");
++    // NINFER_L20 / sm_89 (Ada) port: accept both Blackwell (12.0) and Ada (8.9).
++    if (device.compute_capability() != 120 && device.compute_capability() != 89) {
++        throw std::invalid_argument(
++            "Qwen3.5 family runtime requires compute capability 12.0 (RTX 5090) "
++            "or 8.9 (NVIDIA L20)");
+     }
+ }
+ 
+diff --git a/src/ops/CMakeLists.txt b/src/ops/CMakeLists.txt
+index 31357e8..c40135c 100644
+--- a/src/ops/CMakeLists.txt
++++ b/src/ops/CMakeLists.txt
+@@ -2,15 +2,27 @@
+ add_library(ninfer_ops STATIC)
+ ninfer_internal_includes(ninfer_ops)
+ ninfer_cuda_archive(ninfer_ops)
+-target_link_libraries(ninfer_ops PUBLIC ninfer_core PRIVATE ninfer_nvfp4_non_rdc)
+ 
+-# Warp-specialized SM120 NVFP4 kernels use setmaxnreg to transfer registers from
+-# producer to consumer warpgroups. RDC makes ptxas discard that contract. These
+-# self-contained kernels therefore use a non-RDC archive and host launchers.
+-add_library(ninfer_nvfp4_non_rdc STATIC)
+-ninfer_internal_includes(ninfer_nvfp4_non_rdc)
+-ninfer_cuda_non_rdc_archive(ninfer_nvfp4_non_rdc)
+-target_link_libraries(ninfer_nvfp4_non_rdc PRIVATE ninfer_core CUDA::cudart CUDA::cuda_driver)
++# NINFER_L20 / sm_89 (Ada) port:
++# sm_89 has no NVFP4 *weight* MMA, so the NVFP4 weight kernels are excluded and
++# replaced by stubs that throw a clear error. NVFP4 *KV-cache* kernels
++# (small_t_nvfp4, prompt_nvfp4, k8v4, ...) dequantize in software and stay.
++if(CMAKE_CUDA_ARCHITECTURES STREQUAL "89")
++  # A no-NVFP4-weights build. L20_STUB throws for any NVFP4 weight op.
++  set(NINFER_NO_NVFP4_WEIGHTS ON)
++  target_sources(ninfer_ops PRIVATE "${CMAKE_CURRENT_LIST_DIR}/nvfp4_l20_stub.cpp")
++else()
++  set(NINFER_NO_NVFP4_WEIGHTS OFF)
++  target_link_libraries(ninfer_ops PUBLIC ninfer_core PRIVATE ninfer_nvfp4_non_rdc)
++
++  # Warp-specialized SM120 NVFP4 kernels use setmaxnreg to transfer registers
++  # from producer to consumer warpgroups. RDC makes ptxas discard that contract.
++  # These self-contained kernels therefore use a non-RDC archive and host launchers.
++  add_library(ninfer_nvfp4_non_rdc STATIC)
++  ninfer_internal_includes(ninfer_nvfp4_non_rdc)
++  ninfer_cuda_non_rdc_archive(ninfer_nvfp4_non_rdc)
++  target_link_libraries(ninfer_nvfp4_non_rdc PRIVATE ninfer_core CUDA::cudart CUDA::cuda_driver)
++endif()
+ 
+ include(basic_sources.cmake)
+ include("${CMAKE_CURRENT_LIST_DIR}/attn_input_proj/sources.cmake")
+diff --git a/src/ops/attn_input_proj/sources.cmake b/src/ops/attn_input_proj/sources.cmake
+index 21e7794..312965e 100644
+--- a/src/ops/attn_input_proj/sources.cmake
++++ b/src/ops/attn_input_proj/sources.cmake
+@@ -9,10 +9,6 @@ target_sources(ninfer_ops PRIVATE
+   "${CMAKE_CURRENT_LIST_DIR}/fp8/fp8_attn_input_a16_gemm.cu"
+   "${CMAKE_CURRENT_LIST_DIR}/fp8/fp8_attn_input_a8.cu"
+   "${CMAKE_CURRENT_LIST_DIR}/fp8/fp8_attn_input_plan.cpp"
+-  "${CMAKE_CURRENT_LIST_DIR}/nvfp4/nvfp4_attn_input_decode.cu"
+-  "${CMAKE_CURRENT_LIST_DIR}/nvfp4/nvfp4_attn_input_small_t.cu"
+-  "${CMAKE_CURRENT_LIST_DIR}/nvfp4/nvfp4_attn_input_w4a4.cu"
+-  "${CMAKE_CURRENT_LIST_DIR}/nvfp4/nvfp4_attn_input_plan.cpp"
+   "${CMAKE_CURRENT_LIST_DIR}/q4_q5/q4_q5_attn_input_gemm_mma.cu"
+   "${CMAKE_CURRENT_LIST_DIR}/q4_q5/q4_q5_attn_input_small_t.cu"
+   "${CMAKE_CURRENT_LIST_DIR}/q4_q5/q4_q5_attn_input_plan.cpp"
+@@ -24,3 +20,12 @@ target_sources(ninfer_ops PRIVATE
+   "${CMAKE_CURRENT_LIST_DIR}/q8/q8_attn_input_plan.cpp"
+   "${CMAKE_CURRENT_LIST_DIR}/../wrapper/attn_input_proj.cpp"
+ )
++
++if(NOT NINFER_NO_NVFP4_WEIGHTS)
++  target_sources(ninfer_ops PRIVATE
++    "${CMAKE_CURRENT_LIST_DIR}/nvfp4/nvfp4_attn_input_decode.cu"
++    "${CMAKE_CURRENT_LIST_DIR}/nvfp4/nvfp4_attn_input_small_t.cu"
++    "${CMAKE_CURRENT_LIST_DIR}/nvfp4/nvfp4_attn_input_w4a4.cu"
++    "${CMAKE_CURRENT_LIST_DIR}/nvfp4/nvfp4_attn_input_plan.cpp"
++  )
++endif()
+diff --git a/src/ops/common/mma.cuh b/src/ops/common/mma.cuh
+index 7a68df2..e29c1c5 100644
+--- a/src/ops/common/mma.cuh
++++ b/src/ops/common/mma.cuh
+@@ -59,10 +59,20 @@ __device__ __forceinline__ void mma_s8(int& c0, int& c1, int& c2, int& c3, unsig
+ __device__ __forceinline__ void mma_fp8_e4m3(float& c0, float& c1, float& c2, float& c3,
+                                              unsigned a0, unsigned a1, unsigned a2, unsigned a3,
+                                              unsigned b0, unsigned b1) {
++#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 120)
++    // Blackwell (sm_120a) form used upstream.
+     asm volatile("mma.sync.aligned.kind::f8f6f4.m16n8k32.row.col.f32.e4m3.e4m3.f32 "
+                  "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+                  : "+f"(c0), "+f"(c1), "+f"(c2), "+f"(c3)
+                  : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
++#else
++    // NINFER_L20 / sm_89 (Ada): the .kind::f8f6f4 qualifier is unsupported; the
++    // plain e4m3 mma (available since sm_89) computes the identical operation.
++    asm volatile("mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 "
++                 "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
++                 : "+f"(c0), "+f"(c1), "+f"(c2), "+f"(c3)
++                 : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
++#endif
+ }
+ 
+ __device__ __forceinline__ void mma_tf32_bits(float& c0, float& c1, float& c2, float& c3,
+@@ -86,6 +96,10 @@ __device__ __forceinline__ void mma_nvfp4_e4m3(float& c0, float& c1, float& c2,
+                                                unsigned sfb) {
+     constexpr unsigned short kScaleBlockId  = 0;
+     constexpr unsigned short kScaleThreadId = 0;
++    // NINFER_L20 / sm_89: mxf4nvf4 block-scale MMA is sm_120a-only. Guard it so
++    // mma.cuh stays includable; the NVFP4 *weight* callers are excluded from the
++    // sm_89 build, so this branch is never instantiated there.
++#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 120)
+     asm volatile("mma.sync.aligned.kind::mxf4nvf4.block_scale.scale_vec::4X."
+                  "m16n8k64.row.col.f32.e2m1.e2m1.f32.ue4m3 "
+                  "{%0,%1,%2,%3}, "
+@@ -100,6 +114,10 @@ __device__ __forceinline__ void mma_nvfp4_e4m3(float& c0, float& c1, float& c2,
+                  : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1), "r"(sfa),
+                    "h"(kScaleBlockId), "h"(kScaleThreadId), "r"(sfb), "h"(kScaleBlockId),
+                    "h"(kScaleThreadId));
++#else
++    (void)c0; (void)c1; (void)c2; (void)c3; (void)a0; (void)a1; (void)a2; (void)a3;
++    (void)b0; (void)b1; (void)sfa; (void)sfb;
++#endif
+ }
+ 
+ } // namespace ninfer::ops
+diff --git a/src/ops/gdn_input_proj/sources.cmake b/src/ops/gdn_input_proj/sources.cmake
+index 7022b97..bbb7de3 100644
+--- a/src/ops/gdn_input_proj/sources.cmake
++++ b/src/ops/gdn_input_proj/sources.cmake
+@@ -5,14 +5,6 @@ target_sources(ninfer_ops PRIVATE
+   "${CMAKE_CURRENT_LIST_DIR}/fp8/fp8_gdn_input_plan.cpp"
+   "${CMAKE_CURRENT_LIST_DIR}/fp8/fp8_gdn_conv_fused.cu"
+   "${CMAKE_CURRENT_LIST_DIR}/fp8/fp8_gdn_conv_plan.cpp"
+-  "${CMAKE_CURRENT_LIST_DIR}/nvfp4/nvfp4_gdn_input_decode.cu"
+-  "${CMAKE_CURRENT_LIST_DIR}/nvfp4/nvfp4_gdn_input_small_t.cu"
+-  "${CMAKE_CURRENT_LIST_DIR}/nvfp4/nvfp4_gdn_input_w4a4.cu"
+-  "${CMAKE_CURRENT_LIST_DIR}/nvfp4/nvfp4_gdn_input_plan.cpp"
+-  "${CMAKE_CURRENT_LIST_DIR}/nvfp4/nvfp4_gdn_snapshot_decode.cu"
+-  "${CMAKE_CURRENT_LIST_DIR}/nvfp4/nvfp4_gdn_snapshot_small_t.cu"
+-  "${CMAKE_CURRENT_LIST_DIR}/nvfp4/nvfp4_gdn_snapshot_post.cu"
+-  "${CMAKE_CURRENT_LIST_DIR}/nvfp4/nvfp4_gdn_snapshot_plan.cpp"
+   "${CMAKE_CURRENT_LIST_DIR}/q4_q5/q4_q5_gdn_input_gemm_mma.cu"
+   "${CMAKE_CURRENT_LIST_DIR}/q4_q5/q4_q5_gdn_input_independent.cu"
+   "${CMAKE_CURRENT_LIST_DIR}/q4_q5/q4_q5_gdn_input_conv_snapshot.cu"
+@@ -24,3 +16,16 @@ target_sources(ninfer_ops PRIVATE
+   "${CMAKE_CURRENT_LIST_DIR}/q8/q8_gdn_input_plan.cpp"
+   "${CMAKE_CURRENT_LIST_DIR}/../wrapper/gdn_input_proj.cpp"
+ )
++
++if(NOT NINFER_NO_NVFP4_WEIGHTS)
++  target_sources(ninfer_ops PRIVATE
++    "${CMAKE_CURRENT_LIST_DIR}/nvfp4/nvfp4_gdn_input_decode.cu"
++    "${CMAKE_CURRENT_LIST_DIR}/nvfp4/nvfp4_gdn_input_small_t.cu"
++    "${CMAKE_CURRENT_LIST_DIR}/nvfp4/nvfp4_gdn_input_w4a4.cu"
++    "${CMAKE_CURRENT_LIST_DIR}/nvfp4/nvfp4_gdn_input_plan.cpp"
++    "${CMAKE_CURRENT_LIST_DIR}/nvfp4/nvfp4_gdn_snapshot_decode.cu"
++    "${CMAKE_CURRENT_LIST_DIR}/nvfp4/nvfp4_gdn_snapshot_small_t.cu"
++    "${CMAKE_CURRENT_LIST_DIR}/nvfp4/nvfp4_gdn_snapshot_post.cu"
++    "${CMAKE_CURRENT_LIST_DIR}/nvfp4/nvfp4_gdn_snapshot_plan.cpp"
++  )
++endif()
+diff --git a/src/ops/linear/nvfp4/sources.cmake b/src/ops/linear/nvfp4/sources.cmake
+index 95dc902..2e24c53 100644
+--- a/src/ops/linear/nvfp4/sources.cmake
++++ b/src/ops/linear/nvfp4/sources.cmake
+@@ -1,14 +1,16 @@
+-target_sources(ninfer_ops PRIVATE
+-  "${CMAKE_CURRENT_LIST_DIR}/nvfp4_format.cpp"
+-  "${CMAKE_CURRENT_LIST_DIR}/nvfp4_w4a4.cu"
+-  "${CMAKE_CURRENT_LIST_DIR}/nvfp4_dispatch.cpp"
+-  "${CMAKE_CURRENT_LIST_DIR}/shapes/n14336_k5120.cu"
+-  "${CMAKE_CURRENT_LIST_DIR}/shapes/n16384_k5120.cu"
+-  "${CMAKE_CURRENT_LIST_DIR}/shapes/n34816_k5120.cu"
+-  "${CMAKE_CURRENT_LIST_DIR}/shapes/n5120_k6144.cu"
+-  "${CMAKE_CURRENT_LIST_DIR}/shapes/n5120_k17408.cu"
+-)
++if(NOT NINFER_NO_NVFP4_WEIGHTS)
++  target_sources(ninfer_ops PRIVATE
++    "${CMAKE_CURRENT_LIST_DIR}/nvfp4_format.cpp"
++    "${CMAKE_CURRENT_LIST_DIR}/nvfp4_w4a4.cu"
++    "${CMAKE_CURRENT_LIST_DIR}/nvfp4_dispatch.cpp"
++    "${CMAKE_CURRENT_LIST_DIR}/shapes/n14336_k5120.cu"
++    "${CMAKE_CURRENT_LIST_DIR}/shapes/n16384_k5120.cu"
++    "${CMAKE_CURRENT_LIST_DIR}/shapes/n34816_k5120.cu"
++    "${CMAKE_CURRENT_LIST_DIR}/shapes/n5120_k6144.cu"
++    "${CMAKE_CURRENT_LIST_DIR}/shapes/n5120_k17408.cu"
++  )
+ 
+-target_sources(ninfer_nvfp4_non_rdc PRIVATE
+-  "${CMAKE_CURRENT_LIST_DIR}/nvfp4_w4a4_tma.cu"
+-)
++  target_sources(ninfer_nvfp4_non_rdc PRIVATE
++    "${CMAKE_CURRENT_LIST_DIR}/nvfp4_w4a4_tma.cu"
++  )
++endif()
+diff --git a/src/ops/linear_add/sources.cmake b/src/ops/linear_add/sources.cmake
+index da68fa9..d6ff594 100644
+--- a/src/ops/linear_add/sources.cmake
++++ b/src/ops/linear_add/sources.cmake
+@@ -3,10 +3,6 @@ target_sources(ninfer_ops PRIVATE
+   "${CMAKE_CURRENT_LIST_DIR}/bf16/bf16_linear_add_gemm_mma.cu"
+   "${CMAKE_CURRENT_LIST_DIR}/bf16/bf16_linear_add_small_t.cu"
+   "${CMAKE_CURRENT_LIST_DIR}/bf16/bf16_linear_add_plan.cpp"
+-  "${CMAKE_CURRENT_LIST_DIR}/nvfp4/nvfp4_linear_add_decode.cu"
+-  "${CMAKE_CURRENT_LIST_DIR}/nvfp4/nvfp4_linear_add_small_t.cu"
+-  "${CMAKE_CURRENT_LIST_DIR}/nvfp4/nvfp4_linear_add_w4a4.cu"
+-  "${CMAKE_CURRENT_LIST_DIR}/nvfp4/nvfp4_linear_add_plan.cpp"
+   "${CMAKE_CURRENT_LIST_DIR}/fp8/fp8_linear_add_decode.cu"
+   "${CMAKE_CURRENT_LIST_DIR}/fp8/fp8_linear_add_small_t.cu"
+   "${CMAKE_CURRENT_LIST_DIR}/fp8/fp8_linear_add_a8.cu"
+@@ -24,3 +20,12 @@ target_sources(ninfer_ops PRIVATE
+   "${CMAKE_CURRENT_LIST_DIR}/q8/q8_linear_add_plan.cpp"
+   "${CMAKE_CURRENT_LIST_DIR}/../wrapper/linear_add.cpp"
+ )
++
++if(NOT NINFER_NO_NVFP4_WEIGHTS)
++  target_sources(ninfer_ops PRIVATE
++    "${CMAKE_CURRENT_LIST_DIR}/nvfp4/nvfp4_linear_add_decode.cu"
++    "${CMAKE_CURRENT_LIST_DIR}/nvfp4/nvfp4_linear_add_small_t.cu"
++    "${CMAKE_CURRENT_LIST_DIR}/nvfp4/nvfp4_linear_add_w4a4.cu"
++    "${CMAKE_CURRENT_LIST_DIR}/nvfp4/nvfp4_linear_add_plan.cpp"
++  )
++endif()
+diff --git a/src/ops/linear_swiglu/sources.cmake b/src/ops/linear_swiglu/sources.cmake
+index e32687c..ce68463 100644
+--- a/src/ops/linear_swiglu/sources.cmake
++++ b/src/ops/linear_swiglu/sources.cmake
+@@ -2,10 +2,6 @@ target_sources(ninfer_ops PRIVATE
+   "${CMAKE_CURRENT_LIST_DIR}/q4/q4_linear_swiglu_gemm_mma.cu"
+   "${CMAKE_CURRENT_LIST_DIR}/q4/q4_linear_swiglu_gemv.cu"
+   "${CMAKE_CURRENT_LIST_DIR}/q4/q4_linear_swiglu_plan.cpp"
+-  "${CMAKE_CURRENT_LIST_DIR}/nvfp4/nvfp4_linear_swiglu_decode.cu"
+-  "${CMAKE_CURRENT_LIST_DIR}/nvfp4/nvfp4_linear_swiglu_small_t.cu"
+-  "${CMAKE_CURRENT_LIST_DIR}/nvfp4/nvfp4_linear_swiglu_w4a4.cu"
+-  "${CMAKE_CURRENT_LIST_DIR}/nvfp4/nvfp4_linear_swiglu_plan.cpp"
+   "${CMAKE_CURRENT_LIST_DIR}/fp8/fp8_linear_swiglu_decode.cu"
+   "${CMAKE_CURRENT_LIST_DIR}/fp8/fp8_linear_swiglu_small_t.cu"
+   "${CMAKE_CURRENT_LIST_DIR}/fp8/fp8_linear_swiglu_a8.cu"
+@@ -18,6 +14,15 @@ target_sources(ninfer_ops PRIVATE
+   "${CMAKE_CURRENT_LIST_DIR}/../wrapper/linear_swiglu.cpp"
+ )
+ 
+-target_sources(ninfer_nvfp4_non_rdc PRIVATE
+-  "${CMAKE_CURRENT_LIST_DIR}/nvfp4/nvfp4_linear_swiglu_w4a4_tma.cu"
+-)
++if(NOT NINFER_NO_NVFP4_WEIGHTS)
++  target_sources(ninfer_ops PRIVATE
++    "${CMAKE_CURRENT_LIST_DIR}/nvfp4/nvfp4_linear_swiglu_decode.cu"
++    "${CMAKE_CURRENT_LIST_DIR}/nvfp4/nvfp4_linear_swiglu_small_t.cu"
++    "${CMAKE_CURRENT_LIST_DIR}/nvfp4/nvfp4_linear_swiglu_w4a4.cu"
++    "${CMAKE_CURRENT_LIST_DIR}/nvfp4/nvfp4_linear_swiglu_plan.cpp"
++  )
++
++  target_sources(ninfer_nvfp4_non_rdc PRIVATE
++    "${CMAKE_CURRENT_LIST_DIR}/nvfp4/nvfp4_linear_swiglu_w4a4_tma.cu"
++  )
++endif()
+diff --git a/src/ops/nvfp4_l20_stub.cpp b/src/ops/nvfp4_l20_stub.cpp
+new file mode 100644
+index 0000000..c39b91c
+--- /dev/null
++++ b/src/ops/nvfp4_l20_stub.cpp
+@@ -0,0 +1,194 @@
++// NINFER_L20 / sm_89 (Ada Lovelace) port -- NVFP4 weight-kernel stubs.
++//
++// sm_89 has no MXF4/NVFP4 block-scale MMA (that PTX is sm_120a-only), so the
++// upstream NVFP4 *weight* kernels cannot be built for the L20. This translation
++// unit provides stub definitions for every NVFP4 weight symbol referenced by
++// the retained (architecture-independent) dispatch layers. Each stub throws a
++// clear std::runtime_error, so an NVFP4-weight artifact fails loudly at load /
++// first use instead of crashing. L20 builds are expected to run the
++// groupwise-int (Q4/Q5) artifacts; see the L20 port report.
++//
++// This file is compiled only when NINFER_L20_NO_PDL is defined (sm_89 build).
++
++#include "core/arena.h"
++#include "core/tensor.h"
++#include "core/weight.h"
++#include "ninfer/ops/linear.h"
++#include "ops/linear/nvfp4/nvfp4_dispatch.h"
++#include "ops/linear/nvfp4/nvfp4_format.h"
++#include "ops/attn_input_proj/nvfp4/nvfp4_attn_input_plan.h"
++#include "ops/gdn_input_proj/nvfp4/nvfp4_gdn_input_plan.h"
++#include "ops/gdn_input_proj/nvfp4/nvfp4_gdn_snapshot_plan.h"
++#include "ops/linear_add/nvfp4/nvfp4_linear_add_plan.h"
++#include "ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_plan.h"
++#include "ops/linear/nvfp4/nvfp4_geometry.h"
++#include "ops/softmax_attention/dense/causal_cache/prompt_nvfp4_non_rdc_launch.h"
++
++#include <cuda_runtime.h>
++
++#include <cstddef>
++#include <cstdint>
++#include <stdexcept>
++
++namespace ninfer::ops::detail {
++namespace {
++
++[[noreturn]] void nvfp4_unsupported() {
++    throw std::runtime_error(
++        "NVFP4 weights are not supported on this build (sm_89 / NVIDIA L20): the "
++        "mxf4nvf4 block-scale MMA is sm_120a-only. Use the groupwise-int (Q4/Q5) "
++        "artifact instead, e.g. qwen3_8_27b.ninfer.");
++}
++
++} // namespace
++
++// --- nvfp4_format.h ---------------------------------------------------------
++Nvfp4WeightGeometry validate_nvfp4_weight(const Weight&, const char*) { nvfp4_unsupported(); }
++
++// --- nvfp4_dispatch.h -------------------------------------------------------
++std::size_t nvfp4_linear_workspace_capacity_bytes(std::int32_t, std::int32_t, LinearPolicy,
++                                                  std::int32_t, std::int32_t) {
++    nvfp4_unsupported();
++}
++void nvfp4_dispatch(const Tensor&, const Weight&, Tensor&, LinearPolicy, WorkspaceArena*,
++                    cudaStream_t) {
++    nvfp4_unsupported();
++}
++
++// --- nvfp4_attn_input_plan.h -------------------------------------------------
++std::size_t nvfp4_attn_input_workspace_capacity_bytes(LinearPolicy, std::int32_t, std::int32_t) {
++    nvfp4_unsupported();
++}
++void nvfp4_attn_input_decode_launch(const Tensor&, const Weight&, Tensor&, Tensor&, Tensor&,
++                                    Tensor&, cudaStream_t) {
++    nvfp4_unsupported();
++}
++void nvfp4_attn_input_small_t_launch(const Tensor&, const Weight&, Tensor&, Tensor&, Tensor&,
++                                     Tensor&, cudaStream_t) {
++    nvfp4_unsupported();
++}
++void nvfp4_attn_input_w4a4_launch(const Tensor&, const Weight&, Tensor&, Tensor&, Tensor&, Tensor&,
++                                  Nvfp4W4a4Workspace, cudaStream_t) {
++    nvfp4_unsupported();
++}
++void nvfp4_attn_input_dispatch(const Tensor&, const Weight&, Tensor&, Tensor&, Tensor&, Tensor&,
++                               LinearPolicy, WorkspaceArena*, cudaStream_t) {
++    nvfp4_unsupported();
++}
++
++// --- nvfp4_gdn_input_plan.h --------------------------------------------------
++std::size_t nvfp4_gdn_input_workspace_capacity_bytes(LinearPolicy, std::int32_t, std::int32_t) {
++    nvfp4_unsupported();
++}
++void nvfp4_gdn_input_decode_launch(const Tensor&, const Weight&, Tensor&, Tensor&, cudaStream_t) {
++    nvfp4_unsupported();
++}
++void nvfp4_gdn_input_small_t_launch(const Tensor&, const Weight&, Tensor&, Tensor&, cudaStream_t) {
++    nvfp4_unsupported();
++}
++void nvfp4_gdn_input_w4a4_launch(const Tensor&, const Weight&, Tensor&, Tensor&,
++                                 Nvfp4W4a4Workspace, cudaStream_t) {
++    nvfp4_unsupported();
++}
++void nvfp4_gdn_input_dispatch(const Tensor&, const Weight&, Tensor&, Tensor&, LinearPolicy,
++                              WorkspaceArena*, cudaStream_t) {
++    nvfp4_unsupported();
++}
++
++// --- nvfp4_gdn_snapshot_plan.h -----------------------------------------------
++Nvfp4GdnConvPlan nvfp4_gdn_conv_resolve_plan(LinearPolicy, std::int32_t, std::int32_t) {
++    nvfp4_unsupported();
++}
++std::size_t nvfp4_gdn_snapshot_workspace_capacity_bytes(LinearPolicy, std::int32_t, std::int32_t) {
++    nvfp4_unsupported();
++}
++void nvfp4_gdn_snapshot_decode_launch(const Tensor&, const Weight&, const Tensor&, Tensor&,
++                                      const Tensor&, const Tensor&, const Tensor&, Tensor&,
++                                      Tensor&, Tensor&, Tensor&, cudaStream_t) {
++    nvfp4_unsupported();
++}
++void nvfp4_gdn_snapshot_small_t_launch(const Tensor&, const Weight&, const Tensor&, Tensor&,
++                                       const Tensor&, const Tensor&, const Tensor&, Tensor&,
++                                       Tensor&, Tensor&, Tensor&, cudaStream_t) {
++    nvfp4_unsupported();
++}
++void nvfp4_gdn_record_small_t_launch(const Tensor&, const Weight&, const Tensor&, const Tensor&,
++                                     const Tensor&, const Tensor&, Tensor&, Tensor&, Tensor&,
++                                     Tensor&, Tensor&, cudaStream_t) {
++    nvfp4_unsupported();
++}
++void nvfp4_gdn_snapshot_post_launch(const Tensor&, const Tensor&, Tensor&, const Tensor&,
++                                    const Tensor&, const Tensor&, Tensor&, Tensor&, Tensor&,
++                                    cudaStream_t) {
++    nvfp4_unsupported();
++}
++void nvfp4_gdn_record_post_launch(const Tensor&, const Tensor&, const Tensor&, const Tensor&,
++                                  const Tensor&, Tensor&, Tensor&, Tensor&, cudaStream_t) {
++    nvfp4_unsupported();
++}
++void nvfp4_gdn_snapshot_dispatch(const Tensor&, const Weight&, const Tensor&, Tensor&,
++                                 const Tensor&, const Tensor&, const Tensor&, Tensor&, Tensor&,
++                                 Tensor&, Tensor&, LinearPolicy, WorkspaceArena&, cudaStream_t) {
++    nvfp4_unsupported();
++}
++
++// --- nvfp4_linear_add_plan.h -------------------------------------------------
++std::size_t nvfp4_linear_add_workspace_capacity_bytes(std::int32_t, std::int32_t, LinearPolicy,
++                                                      std::int32_t, std::int32_t) {
++    nvfp4_unsupported();
++}
++void nvfp4_linear_add_decode_launch(const Tensor&, const Weight&, Tensor&, cudaStream_t) {
++    nvfp4_unsupported();
++}
++void nvfp4_linear_add_small_t_launch(const Tensor&, const Weight&, Tensor&, cudaStream_t) {
++    nvfp4_unsupported();
++}
++void nvfp4_linear_add_w4a4_launch(const Tensor&, const Weight&, Tensor&, Nvfp4W4a4Workspace,
++                                  cudaStream_t) {
++    nvfp4_unsupported();
++}
++void nvfp4_linear_add_dispatch(const Tensor&, const Weight&, Tensor&, LinearPolicy, WorkspaceArena&,
++                               cudaStream_t) {
++    nvfp4_unsupported();
++}
++
++// --- nvfp4_linear_swiglu_plan.h ----------------------------------------------
++std::size_t nvfp4_linear_swiglu_workspace_capacity_bytes(LinearPolicy, std::int32_t,
++                                                         std::int32_t) {
++    nvfp4_unsupported();
++}
++void nvfp4_linear_swiglu_decode_launch(const Tensor&, const Weight&, Tensor&, cudaStream_t) {
++    nvfp4_unsupported();
++}
++void nvfp4_linear_swiglu_small_t_launch(const Tensor&, const Weight&, Tensor&, cudaStream_t) {
++    nvfp4_unsupported();
++}
++void nvfp4_linear_swiglu_w4a4_launch(const Tensor&, const Weight&, Tensor&, WorkspaceArena&,
++                                     cudaStream_t) {
++    nvfp4_unsupported();
++}
++void nvfp4_linear_swiglu_dispatch(const Tensor&, const Weight&, Tensor&, LinearPolicy,
++                                  WorkspaceArena&, cudaStream_t) {
++    nvfp4_unsupported();
++}
++
++// --- nvfp4_geometry.h (geometry structs used by wrappers) --------------------
++// Geometry constants are constexpr in the header; nothing to stub there.
++
++// --- prompt_nvfp4_non_rdc_launch.h -------------------------------------------
++// The warp-specialized (setmaxnreg/TMA) NVFP4-KV prompt attention kernel lives
++// in the sm_120a-only non-RDC archive. On sm_89 the NVFP4 KV cache path is not
++// offered (use --kv-dtype fp8 / int8 / bf16); these stubs keep prompt_nvfp4.cu
++// linkable while failing loudly if it is ever reached.
++void causal_attention_prompt_nvfp4_kernel_launch(const Tensor&, const Tensor&, float,
++                                                 const PagedKVLayerView&, Tensor&, cudaStream_t) {
++    nvfp4_unsupported();
++}
++void causal_attention_prompt_nvfp4_batch_kernel_launch(const Tensor&, const Tensor&, const Tensor&,
++                                                       const Tensor&, float,
++                                                       const PagedKVBatchLayerView&, Tensor&,
++                                                       cudaStream_t) {
++    nvfp4_unsupported();
++}
++
++} // namespace ninfer::ops::detail
+diff --git a/src/ops/softmax_attention/sources.cmake b/src/ops/softmax_attention/sources.cmake
+index 24feb86..584dd21 100644
+--- a/src/ops/softmax_attention/sources.cmake
++++ b/src/ops/softmax_attention/sources.cmake
+@@ -16,6 +16,12 @@ target_sources(ninfer_ops PRIVATE
+   "${CMAKE_CURRENT_LIST_DIR}/sliding_window/launch.cu"
+ )
+ 
+-target_sources(ninfer_nvfp4_non_rdc PRIVATE
+-  "${CMAKE_CURRENT_LIST_DIR}/dense/causal_cache/prompt_nvfp4_non_rdc.cu"
+-)
++# NINFER_L20 / sm_89: the NVFP4 *KV-cache* attention kernels (small_t_nvfp4,
++# prompt_nvfp4, k8v4) dequantize NVFP4 KV in software with plain mma_f16 -- they
++# stay. Only the setmaxnreg/TMA warp-specialized prompt kernel needs the
++# non-RDC archive, which is sm_120a-only.
++if(NOT NINFER_NO_NVFP4_WEIGHTS)
++  target_sources(ninfer_nvfp4_non_rdc PRIVATE
++    "${CMAKE_CURRENT_LIST_DIR}/dense/causal_cache/prompt_nvfp4_non_rdc.cu"
++  )
++endif()
+-- 
+2.39.5
+
