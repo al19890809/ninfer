@@ -155,3 +155,64 @@ only when that work is in scope. Install or upgrade dependencies only when the t
 
 Create commits only when requested. Use Conventional Commit subjects with concise lowercase types
 such as `feat`, `fix`, `perf`, `bench`, `test`, `build`, `refactor`, `docs`, or `chore`.
+
+## Remote deployment (gs@192.168.0.16 — NVIDIA L20)
+
+### Hardware and toolchain
+- GPU: NVIDIA L20 (sm_89, Ada architecture, 46,068 MiB, 864 GB/s)
+- CUDA: 12.8, driver 13.2, nvcc at `/usr/local/cuda-12.8/bin/nvcc`
+- Python: system python3 3.12.3 (stdlib-only tools; no conda needed)
+- Systemd-managed services: `vllm-30000.service` (GPU0), `ninfer-30002.service` (GPU1)
+
+### Build configuration
+```bash
+cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_CUDA_ARCHITECTURES=89 \
+  -DCMAKE_CUDA_COMPILER=/usr/local/cuda-12.8/bin/nvcc \
+  -DNINFER_BUILD_BENCHMARKS=ON
+cmake --build build -j128
+```
+
+### Production service (ninfer-30002)
+- Unit file: `/etc/systemd/system/ninfer-30002.service`
+- Model: `/home/gs/models/qwen3_8_27b.ninfer` (Qwen3.8-27B official Q4/Q5 + DFlash2, 20.4 GB)
+- Log: `/data/model-logs/ninfer-30002-gpu1.log` (same naming convention as vllm)
+- Current config: `--max-context 204800 --max-concurrency 2 --kv-dtype bf16 --spec dflash2 --draft-tokens 3 --lm-head-draft --vision --temperature 0.6 --presence-penalty 0.0 --pending-timeout-ms 300000`
+- Management: `sudo systemctl start|stop|restart|status ninfer-30002`
+
+### L20 port (sm_89 branch)
+- Branch: `ninfer-L20` on Gitee (`https://gitee.com/al19890809/ninfer`)
+- Canonical commits: `52b7c3de` (port) → `0d4e4e13` (arch guard fix) → `b7afcf57` (smem fix) → `35a18fd9` (patches commit)
+- Critical sm_89 constraints: static shared mem cap = 48KB (0xc000), enforced at nvlink; dynamic pool up to ~99KB with `cudaFuncSetAttribute(MaxDynamicSharedMemorySize)`
+- Dual-path pattern for all Q8 kernels: `constexpr bool kDynamicShared = sizeof(Storage) > kStaticSharedLimitBytes; __shared__ unsigned char static_shared[kDynamicShared ? 1 : sizeof(Storage)]; extern __shared__ unsigned char dynamic_shared[];`
+- Patch directory `patches/` contains deployment artifacts: `ninfer-l20-sm89.patch` (initial port) and `ninfer-l20-sm89-full.patch` (cumulative, includes all fixes). The full patch is required for deployment from clean source.
+
+### Deployment from Gitee
+```bash
+git clone https://gitee.com/al19890809/ninfer.git
+cd ninfer
+git apply patches/ninfer-l20-sm89-full.patch
+cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_CUDA_ARCHITECTURES=89 -DCMAKE_CUDA_COMPILER=/usr/local/cuda-12.8/bin/nvcc \
+  -DNINFER_BUILD_BENCHMARKS=ON
+cmake --build build -j128
+```
+
+### Performance characteristics (L20, Qwen3.8-27B, bf16 KV)
+| Scenario | Throughput | Notes |
+|---|---|---|
+| prefill pp512 / pp2048 | 1,625 / 1,672 tok/s | Q4/Q5 GEMM is bandwidth-bound, not compute-bound |
+| decode (no spec) | 38.5 tok/s | ≈ 864 GB/s bandwidth ceiling × 77% |
+| decode DFlash2 (w3, temp=0.6) | 75.5–80.5 tok/s | Acceptance ~49%, draft-tokens 3 optimal |
+| decode DFlash2 (w7, temp=1.0) | 63.0 tok/s | Acceptance ~23%, window 7 suboptimal at temp=1.0 |
+| perplexity quick (261K tokens) | int8 4.34333 vs bf16 4.34303 | Δ +0.007%, int8 KV numerically lossless |
+
+Key insight: L20's compute (BF16 119 TFLOPS) is weaker than 5090 (825 TFLOPS), but decode is bandwidth-bound on both. The advantage is memory (46 GB vs 24 GB), enabling larger KV pools and longer contexts. Speculative decoding acceptance is strongly temperature-dependent: temp=1.0 → ~23%, temp=0.6 → ~30%, greedy → 88%. For code generation, temperature ≤ 0.6 is recommended.
+
+### GPU topology (gs@192.168.0.16)
+| GPU | Service | Memory |
+|---|---|---|
+| GPU0 | vllm-30000 (Qwen3.6-35B-A3B-AWQ) | ~41.6 GB |
+| GPU1 | ninfer-30002 (Qwen3.8-27B) | ~43.6 GB |
+
+Services are mutually exclusive per GPU. Switching models requires stopping the other service first.
