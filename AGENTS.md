@@ -150,17 +150,16 @@ cmake --build build -j128
 - Management: `sudo systemctl start|stop|restart|status ninfer-30002`
 
 ### L20 port (sm_89 branch)
-- Branch: `ninfer-L20` on Gitee (`https://gitee.com/al19890809/ninfer`)
+- Branch: `merge-l20` on GitHub (`https://github.com/al19890809/ninfer`); upstream mainline is `Neroued/ninfer`
 - Canonical commits: `52b7c3de` (port) → `0d4e4e13` (arch guard fix) → `b7afcf57` (smem fix) → `35a18fd9` (patches commit)
 - Critical sm_89 constraints: static shared mem cap = 48KB (0xc000), enforced at nvlink; dynamic pool up to ~99KB with `cudaFuncSetAttribute(MaxDynamicSharedMemorySize)`
 - Dual-path pattern for all Q8 kernels: `constexpr bool kDynamicShared = sizeof(Storage) > kStaticSharedLimitBytes; __shared__ unsigned char static_shared[kDynamicShared ? 1 : sizeof(Storage)]; extern __shared__ unsigned char dynamic_shared[];`
-- Patch directory `patches/` contains deployment artifacts: `ninfer-l20-sm89.patch` (initial port) and `ninfer-l20-sm89-full.patch` (cumulative, includes all fixes). The full patch is required for deployment from clean source.
+- Patch directory `patches/` holds historical deployment artifacts: `ninfer-l20-sm89.patch` (initial port) and `ninfer-l20-sm89-full.patch` (cumulative). These are superseded — the L20 adaptations are now committed directly in the `merge-l20` branch, so deployment no longer applies them.
 
-### Deployment from Gitee
+### Deployment from GitHub
 ```bash
-git clone https://gitee.com/al19890809/ninfer.git
+git clone -b merge-l20 https://github.com/al19890809/ninfer.git
 cd ninfer
-git apply patches/ninfer-l20-sm89-full.patch
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
   -DCMAKE_CUDA_ARCHITECTURES=89 -DCMAKE_CUDA_COMPILER=/usr/local/cuda-12.8/bin/nvcc \
   -DNINFER_BUILD_BENCHMARKS=ON
