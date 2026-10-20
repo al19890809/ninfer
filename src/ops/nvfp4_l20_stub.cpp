@@ -20,7 +20,7 @@
 #include "ops/softmax_attention/dense/causal_cache/k8v4/plan.h"
 #include "ops/softmax_attention/dense/causal_cache/k8v4/launch.h"
 #include "ops/softmax_attention/dense/causal_cache/nvfp4/launch.h"
-#include "ops/softmax_attention/dense/causal_cache/nvfp4/plan.h
+#include "ops/softmax_attention/dense/causal_cache/nvfp4/plan.h"
 #include "ops/moe/kernels/cuda/block_scaled/fp8/launch.h"
 #include "ops/moe/kernels/cuda/block_scaled/nvfp4/launch.h"
 
