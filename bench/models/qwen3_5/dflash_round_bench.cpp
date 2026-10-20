@@ -1,4 +1,4 @@
-#include "runtime/engine/model_instance.h"
+#include "runtime/engine/model_construction.h"
 
 #include "core/device.h"
 #include "runtime/engine/context_cache/context_cost.h"
@@ -20,13 +20,12 @@
 #include <string>
 #include <string_view>
 #include <utility>
-#include <variant>
 #include <vector>
 
 namespace {
 
-namespace qwen = ninfer::models::qwen3_5;
-using Clock    = std::chrono::steady_clock;
+namespace q35 = ninfer::models::qwen3_5;
+using Clock   = std::chrono::steady_clock;
 
 struct Options {
     std::filesystem::path artifact = "out/qwen3_6_35b_a3b.ninfer";
@@ -132,8 +131,8 @@ struct RoundMeasurement {
     std::array<ninfer::SpeculativeStats, ninfer::kMaximumConcurrency> stats{};
 };
 
-RoundMeasurement measure_round(qwen::Program& program, ninfer::DeviceContext& device,
-                               std::span<const qwen::SequenceHandle> sequences,
+RoundMeasurement measure_round(q35::Program& program, ninfer::DeviceContext& device,
+                               std::span<const q35::SequenceHandle> sequences,
                                std::uint32_t batch_size, std::uint32_t draft_tokens) {
     std::array<ninfer::runtime::RoundBudget, ninfer::kMaximumConcurrency> budgets{};
     for (std::uint32_t row = 0; row < batch_size; ++row) {
@@ -141,6 +140,16 @@ RoundMeasurement measure_round(qwen::Program& program, ninfer::DeviceContext& de
     }
     const auto budget_span =
         std::span<const ninfer::runtime::RoundBudget>(budgets.data(), batch_size);
+    // Resource scheduling stays outside both the GPU and wall decode/commit intervals.
+    std::array<q35::ExecutionUnit, ninfer::kMaximumConcurrency> units{};
+    for (std::uint32_t row = 0; row < batch_size; ++row) {
+        units[row] = {.sequence = sequences[row],
+                      .kind     = q35::ExecutionUnitKind::Decode,
+                      .tokens   = draft_tokens + 1};
+    }
+    if (!program.reserve_units(std::span<const q35::ExecutionUnit>(units.data(), batch_size))) {
+        throw std::runtime_error("benchmark decode batch could not be reserved");
+    }
     ninfer::CudaEventTimer timer(device);
     const auto wall_start = Clock::now();
     timer.start();
@@ -212,55 +221,48 @@ int run(const Options& options) {
     engine = ninfer::runtime::normalize_engine_options(std::move(engine));
     ninfer::DeviceContext device(options.device);
     auto constructed = ninfer::runtime::construct_model(engine, device);
-    auto& frontend   = constructed.instance->frontend;
-    auto& program    = constructed.instance->program;
+    auto& instance   = std::get<
+          std::unique_ptr<ninfer::runtime::ModelInstance<ninfer::models::qwen3_5::RuntimeTypes>>>(
+        constructed.instance);
+    auto& frontend = instance->frontend;
+    auto& program  = instance->program;
     ninfer::runtime::ResolvedExecutionOptions execution;
     execution.requested_output_tokens = 1 + measured_rounds * (options.draft_tokens + 1);
     execution.allow_prefix_reuse      = false;
-    std::array<qwen::SequenceHandle, ninfer::kMaximumConcurrency> active_sequences{};
+    std::array<q35::SequenceHandle, ninfer::kMaximumConcurrency> active_sequences{};
     for (std::uint32_t lane = 0; lane < options.batch_size; ++lane) {
         auto prompt       = frontend.prepare_tokens(prompt_tokens(options.context_tokens), false);
-        auto request_base = program->plan_request(prompt, execution);
-        auto request_plan =
-            program->inspect_admission(prompt, request_base, ninfer::runtime::LaneId{lane}, nullptr,
-                                       nullptr, std::nullopt, false);
-        if (!request_plan) { throw std::runtime_error("benchmark root admission was rejected"); }
-        auto resource_plan = program->seal_identity(*request_plan, prompt, {});
-        if (!resource_plan) {
-            throw std::runtime_error("benchmark root resources were not sealed");
+        auto request_base = program->plan_request(std::move(prompt), execution);
+        auto source       = program->inspect_source(request_base, std::nullopt);
+        if (!source ||
+            !program->start_binding(request_base, ninfer::runtime::LaneId{lane}, *source)) {
+            throw std::runtime_error("benchmark root binding could not reserve its first unit");
         }
-        const auto reserved =
-            program->start_resource_transaction(std::move(*resource_plan), std::move(prompt), {});
-        if (reserved != ninfer::runtime::ContextTransactionReserveStatus::Reserved) {
-            throw std::runtime_error("benchmark root materialization was not reserved");
-        }
-        std::optional<qwen::MaterializationResult> published;
+        std::optional<q35::SequenceHandle> started;
         for (;;) {
-            auto transaction = program->progress_context_transaction({});
-            if (std::holds_alternative<ninfer::runtime::ContextTransactionInProgress>(
-                    transaction)) {
-                continue;
+            auto progress = program->poll_context({});
+            if (!progress.complete) { continue; }
+            if (progress.kind != q35::ContextOperationKind::Bind || !progress.published ||
+                !progress.sequence) {
+                throw std::runtime_error("benchmark root binding did not publish a sequence");
             }
-            if (!std::holds_alternative<qwen::MaterializationResult>(transaction)) {
-                program->finalize_context_transaction();
-                throw std::runtime_error("benchmark root returned the wrong transaction result");
-            }
-            published.emplace(std::get<qwen::MaterializationResult>(std::move(transaction)));
+            started = progress.sequence;
             break;
         }
-        if (published->status != ninfer::runtime::ContextTransactionStatus::Published ||
-            !published->published) {
-            program->finalize_context_transaction();
-            throw std::runtime_error("benchmark root materialization was not published");
-        }
-        auto started = std::move(*published->published);
-        program->finalize_context_transaction();
-        active_sequences[lane] = started.sequence;
-        std::optional<qwen::PrefillProgress> progress;
-        progress.emplace(program->advance_prefill(active_sequences[lane]));
+        active_sequences[lane]     = *started;
+        const auto advance_prefill = [&] {
+            const std::array<q35::ExecutionUnit, 1> unit{q35::ExecutionUnit{
+                .sequence = active_sequences[lane], .kind = q35::ExecutionUnitKind::Prefill}};
+            if (!program->reserve_units(unit)) {
+                throw std::runtime_error("benchmark seed prefill unit could not be reserved");
+            }
+            return program->advance_prefill(active_sequences[lane]);
+        };
+        std::optional<q35::PrefillProgress> progress;
+        progress.emplace(advance_prefill());
         while (!progress->complete) {
             progress.reset();
-            progress.emplace(program->advance_prefill(active_sequences[lane]));
+            progress.emplace(advance_prefill());
         }
         if (!progress->pending || progress->pending->tokens().size() != 1) {
             throw std::runtime_error("benchmark seed prefill did not license exactly one token");
@@ -271,7 +273,7 @@ int run(const Options& options) {
     }
 
     const auto active_span =
-        std::span<const qwen::SequenceHandle>(active_sequences.data(), options.batch_size);
+        std::span<const q35::SequenceHandle>(active_sequences.data(), options.batch_size);
     RoundMeasurement warmup_state;
     for (int iteration = 0; iteration < options.warmup; ++iteration) {
         warmup_state =
@@ -329,7 +331,7 @@ int run(const Options& options) {
 
     std::cout << "format,ninfer_qwen3_5_dflash_round_bench_v3\n";
     std::cout << "artifact," << options.artifact.string() << '\n';
-    std::cout << "device," << device.props.name << '\n';
+    std::cout << "device," << device.properties().name << '\n';
     std::cout << "context_tokens," << options.context_tokens << '\n';
     std::cout << "draft_tokens," << options.draft_tokens << '\n';
     std::cout << "batch_size," << options.batch_size << '\n';

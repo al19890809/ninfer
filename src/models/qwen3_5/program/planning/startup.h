@@ -1,4 +1,6 @@
 #pragma once
+
+#include "models/common/qwen/vision/vision.h"
 #include "models/qwen3_5/program/internal.h"
 
 #include "core/cyclic_kv_cache.h"
@@ -10,6 +12,7 @@
 #include "models/qwen3_5/program/round_buffers.h"
 #include "models/qwen3_5/state/state_image.h"
 #include "models/load_options.h"
+#include "models/qwen3_5/program/planning/moe.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -42,18 +45,9 @@ struct PersistentLayout {
     std::optional<TensorLayout> score_hidden;
     std::optional<TensorLayout> token_counts;
     std::optional<TensorLayout> sampling_config;
+    std::optional<TensorLayout> grammar_masks;
     std::size_t bytes            = 0;
     std::size_t kv_payload_bytes = 0;
-};
-
-struct VisionWorkspacePlan {
-    std::int32_t output_hidden         = 0;
-    std::uint32_t max_merged_tokens    = 0;
-    std::size_t general_capacity_bytes = 0;
-    std::size_t encode_peak_bytes      = 0;
-    std::size_t handoff_offset_bytes   = 0;
-    std::size_t handoff_capacity_bytes = 0;
-    std::size_t capacity_bytes         = 0;
 };
 
 struct WorkspacePlan {
@@ -65,49 +59,47 @@ struct WorkspacePlan {
     std::size_t dflash_round     = 0;
     std::size_t causal_score     = 0;
     std::size_t general_capacity = 0;
-    std::optional<VisionWorkspacePlan> vision;
+    std::optional<qwen::VisionWorkspacePlan> vision;
     std::size_t capacity = 0;
 };
 
 struct SequencePlanningInputs {
-    const execution::Parameters* parameters = nullptr;
-    std::uint32_t capacity                  = 0;
-    std::uint32_t max_concurrency           = 1;
-    std::uint32_t prefill_chunk             = 0;
-    std::uint32_t draft_window              = 0;
-    SpeculativeBackend speculative_backend  = SpeculativeBackend::None;
-    KvCacheStorage kv_storage               = KvCacheStorage::BFloat16;
-    ProposalHead proposal_head              = ProposalHead::Full;
+    std::shared_ptr<const execution::ModelProfile> profile;
+    std::shared_ptr<const moe::Plan> moe;
+    std::uint32_t capacity                 = 0;
+    std::uint32_t max_concurrency          = 1;
+    std::uint32_t prefill_chunk            = 0;
+    std::uint32_t draft_window             = 0;
+    SpeculativeBackend speculative_backend = SpeculativeBackend::None;
+    KvCacheStorage kv_storage              = KvCacheStorage::BFloat16;
+    ProposalHead proposal_head             = ProposalHead::Full;
     models::LoadOptions features;
-    bool use_cuda_graph = true;
-    bool causal_scoring = false;
-    int device          = 0;
+    bool use_cuda_graph               = true;
+    bool causal_scoring               = false;
+    std::int32_t multiprocessor_count = 0;
     ContextCacheOptions context_cache;
 };
 
-} // namespace ninfer::models::qwen3_5::detail
-
-namespace ninfer::models::qwen3_5::detail {
-
 struct SequencePlanImpl {
-    const execution::Parameters* parameters = nullptr;
-    std::uint32_t capacity                  = 0;
-    std::uint32_t kv_capacity               = 0;
-    std::uint32_t main_page_groups          = 0;
-    std::uint32_t max_concurrency           = 1;
-    std::uint32_t prefill_chunk             = 0;
-    std::uint32_t draft_window              = 0;
-    SpeculativeBackend speculative_backend  = SpeculativeBackend::None;
-    KvCacheStorage kv_storage               = KvCacheStorage::BFloat16;
-    ProposalHead proposal_head              = ProposalHead::Full;
+    std::shared_ptr<const execution::ModelProfile> profile;
+    std::shared_ptr<const moe::Plan> moe;
+    std::uint32_t capacity                 = 0;
+    std::uint32_t kv_capacity              = 0;
+    std::uint32_t main_page_groups         = 0;
+    std::uint32_t max_concurrency          = 1;
+    std::uint32_t prefill_chunk            = 0;
+    std::uint32_t draft_window             = 0;
+    SpeculativeBackend speculative_backend = SpeculativeBackend::None;
+    KvCacheStorage kv_storage              = KvCacheStorage::BFloat16;
+    ProposalHead proposal_head             = ProposalHead::Full;
     models::LoadOptions features;
-    bool use_cuda_graph = true;
-    bool causal_scoring = false;
-    int device          = 0;
+    bool use_cuda_graph               = true;
+    bool causal_scoring               = false;
+    std::int32_t multiprocessor_count = 0;
     ContextCacheOptions context_cache;
     PersistentLayout persistent;
     WorkspacePlan workspace;
-    std::size_t graph_allowance_bytes    = 0;
+    bool graph_probe                     = false;
     std::size_t device_reservation_bytes = 0;
 };
 
@@ -117,16 +109,16 @@ struct SequencePlannerImpl {
     std::unique_ptr<SequencePlanImpl> minimum;
 };
 
-} // namespace ninfer::models::qwen3_5::detail
-
-namespace ninfer::models::qwen3_5::detail {
-
-
 [[nodiscard]] std::unique_ptr<qwen3_5::detail::SequencePlannerImpl>
-make_sequence_planner_impl(const execution::Parameters& parameters, DeviceContext& device,
-                           const EngineOptions& options);
+make_sequence_planner_impl(std::shared_ptr<const execution::ModelProfile> profile,
+                           DeviceContext& device, const EngineOptions& options,
+                           std::shared_ptr<const moe::Plan> moe = {});
 [[nodiscard]] std::unique_ptr<SequencePlanImpl>
 finalize_sequence_plan_impl(std::unique_ptr<qwen3_5::detail::SequencePlannerImpl> planner,
                             std::uint32_t main_page_groups);
+
+[[nodiscard]] std::unique_ptr<SequencePlanImpl>
+make_graph_probe_plan(std::shared_ptr<const execution::ModelProfile>, DeviceContext&,
+                      const EngineOptions&, std::shared_ptr<const moe::Plan>);
 
 } // namespace ninfer::models::qwen3_5::detail

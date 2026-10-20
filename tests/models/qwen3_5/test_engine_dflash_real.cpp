@@ -14,13 +14,14 @@ namespace {
 
 ninfer::EngineOptions base_engine_options(const char* artifact) {
     ninfer::EngineOptions options;
-    options.artifact_path  = artifact;
-    options.max_context    = 128;
-    options.kv_capacity    = ninfer::KvCapacityPolicy::explicit_capacity(128);
-    options.prefill_chunk  = 128;
-    options.kv_cache       = ninfer::KvCacheStorage::BFloat16;
-    options.use_cuda_graph = false;
-    options.enable_vision  = false;
+    options.artifact_path                     = artifact;
+    options.max_context                       = 128;
+    options.kv_capacity                       = ninfer::KvCapacityPolicy::explicit_capacity(128);
+    options.prefill_chunk                     = 128;
+    options.kv_cache                          = ninfer::KvCacheStorage::BFloat16;
+    options.use_cuda_graph                    = false;
+    options.enable_vision                     = false;
+    options.context_cache.host_capacity_bytes = 0;
     return options;
 }
 
@@ -32,7 +33,7 @@ ninfer::EngineOptions dflash_engine_options(const char* artifact, ninfer::Propos
     options.speculative.backend       = ninfer::SpeculativeBackend::DFlash;
     options.speculative.draft_tokens  = 3;
     options.speculative.proposal_head = proposal;
-    options.use_cuda_graph            = true;
+    options.use_cuda_graph            = std::getenv("NINFER_TEST_EAGER") == nullptr;
     options.context_cache.device_state_slots = 2;
     return options;
 }
@@ -50,6 +51,7 @@ ninfer::RequestOptions greedy_options(std::uint32_t outputs, bool reuse) {
     ninfer::RequestOptions options;
     options.execution.requested_output_tokens = outputs;
     options.execution.sampling.temperature    = 0.0F;
+    options.execution.sampling.seed           = 0;
     options.execution.allow_prefix_reuse      = reuse;
     options.stop.include_model_defaults       = false;
     return options;
@@ -85,10 +87,7 @@ ninfer::PromptInput media_conversation(ninfer::MediaKind kind, std::string sessi
     ninfer::PromptInput input;
     input.messages.push_back(std::move(user));
     input.options.enable_thinking = false;
-    if (!session.empty()) {
-        input.context_cache.session_key = std::move(session);
-        input.context_cache.retention   = ninfer::CacheRetentionHint::LiveSession;
-    }
+    if (!session.empty()) { input.context_cache.session_key = std::move(session); }
     return input;
 }
 
@@ -114,7 +113,6 @@ ninfer::PromptInput initial_conversation() {
     ninfer::PromptInput input;
     input.options.enable_thinking   = false;
     input.context_cache.session_key = "dflash-boundary-real";
-    input.context_cache.retention   = ninfer::CacheRetentionHint::LiveSession;
 
     ninfer::ChatMessage user;
     user.role = ninfer::ChatRole::User;
@@ -174,7 +172,8 @@ int verify_dflash_load(const ninfer::Engine& engine) {
         memory.sequence.capacity_bytes == 0 || memory.sequence.used_bytes == 0 ||
         memory.sequence.used_bytes > memory.sequence.capacity_bytes ||
         memory.workspace.capacity_bytes == 0 || memory.vision_workspace.has_value() ||
-        memory.workspace_logical_peak_bytes != 0 || memory.cuda_graph_allowance_bytes == 0) {
+        memory.workspace_logical_peak_bytes != 0 ||
+        (memory.cuda_graph.has_value()) != engine.options().use_cuda_graph) {
         std::cerr << "DFlash Engine has an invalid frozen memory layout\n";
         return 1;
     }
@@ -190,7 +189,7 @@ int exercise_partial_terminal(ninfer::Engine& engine, const std::vector<ninfer::
                       stop) != reference.begin() + static_cast<std::ptrdiff_t>(stop_index)) {
             continue;
         }
-        ninfer::RequestOptions options = greedy_options(24, true);
+        ninfer::RequestOptions options = greedy_options(24, false);
         options.stop.token_ids.push_back(stop);
         const ninfer::GenerationResult stopped =
             engine.generate(engine.prepare_tokens(prompt), options);
@@ -209,15 +208,11 @@ int exercise_partial_terminal(ninfer::Engine& engine, const std::vector<ninfer::
         continuation.insert(continuation.end(), stopped.generated_token_ids.begin(),
                             stopped.generated_token_ids.end());
         continuation.push_back(198);
-        const ninfer::GenerationResult reused = engine.generate(
-            engine.prepare_tokens(std::move(continuation)), greedy_options(2, true));
-        const std::uint32_t expected_reuse =
-            static_cast<std::uint32_t>(prompt.size() + stopped.generated_token_ids.size() - 1);
-        if (reused.reused_prompt_tokens != expected_reuse ||
-            reused.generated_token_ids.size() != 2) {
-            std::cerr << "partial DFlash terminal did not publish its exact context frontier: "
-                      << "reused=" << reused.reused_prompt_tokens << " expected=" << expected_reuse
-                      << '\n';
+        const ninfer::GenerationResult after_stop = engine.generate(
+            engine.prepare_tokens(std::move(continuation)), greedy_options(2, false));
+        if (after_stop.generated_token_ids.size() != 2 ||
+            after_stop.finish_reason != ninfer::FinishReason::OutputLimit) {
+            std::cerr << "request after partial DFlash terminal did not finish its output budget\n";
             return 1;
         }
         return 0;
@@ -374,68 +369,94 @@ int exercise_vision_dflash(const char* artifact, const std::vector<ninfer::Token
 } // namespace
 
 int main() {
-    const char* artifact = std::getenv("NINFER_TEST_ARTIFACT");
-    if (artifact == nullptr || *artifact == '\0') {
-        std::cout << "skip: NINFER_TEST_ARTIFACT is not set\n";
-        return 77;
-    }
-
-    const std::vector<ninfer::TokenId> prompt{
-        248045, 846,    198, 109266, 3709,  96220, 117443, 97913,
-        1710,   248046, 198, 248045, 74455, 198,   248068, 198,
-    };
-    if (const int result = exercise_vision_dflash(artifact, prompt); result != 0) { return result; }
-
-    {
-        ninfer::EngineOptions options =
-            dflash_engine_options(artifact, ninfer::ProposalHead::Full, 128);
-        options.max_concurrency = 2;
-        ninfer::Engine full(std::move(options));
-        auto first  = full.submit(full.prepare_tokens(prompt), greedy_options(17, false));
-        auto second = full.submit(full.prepare_tokens(prompt), greedy_options(9, false));
-        const ninfer::GenerationResult first_result  = first.wait();
-        const ninfer::GenerationResult second_result = second.wait();
-        const auto valid = [&](const ninfer::GenerationResult& result, std::size_t count) {
-            return result.generated_token_ids.size() == count &&
-                   result.finish_reason == ninfer::FinishReason::OutputLimit &&
-                   result.speculative.backend == ninfer::SpeculativeBackend::DFlash &&
-                   result.speculative.rounds != 0;
-        };
-        if (!valid(first_result, 17) || !valid(second_result, 9)) {
-            std::cerr << "concurrent full-head DFlash Graph requests did not complete\n";
-            return 1;
+    try {
+        const char* artifact = std::getenv("NINFER_TEST_ARTIFACT");
+        if (artifact == nullptr || *artifact == '\0') {
+            std::cout << "skip: NINFER_TEST_ARTIFACT is not set\n";
+            return 77;
         }
-    }
 
-    ninfer::Engine engine(dflash_engine_options(artifact, ninfer::ProposalHead::Optimized, 4352));
-    if (const int result = verify_dflash_load(engine); result != 0) { return result; }
-    ninfer::test::speculative_page_boundary(engine);
-    engine.reset_memory_peaks();
-    const ninfer::GenerationResult dflash =
-        engine.generate(engine.prepare_tokens(prompt), greedy_options(24, false));
-    if (dflash.generated_token_ids.size() != 24 ||
-        dflash.finish_reason != ninfer::FinishReason::OutputLimit) {
-        std::cerr << "optimized-head DFlash Graph request did not complete\n";
-        return 1;
-    }
-    const ninfer::MemorySummary memory = engine.memory_summary();
-    if (memory.workspace_logical_peak_bytes == 0 ||
-        memory.workspace_logical_peak_bytes > memory.workspace.capacity_bytes) {
-        std::cerr << "DFlash request did not report a valid planned workspace phase\n";
-        return 1;
-    }
-    if (dflash.speculative.backend != ninfer::SpeculativeBackend::DFlash ||
-        dflash.speculative.rounds == 0) {
-        std::cerr << "DFlash fixture did not execute speculative decode\n";
-        return 1;
-    }
-    if (const int result = exercise_boundary_restore(engine); result != 0) { return result; }
-    if (const int result = exercise_partial_terminal(engine, prompt, dflash.generated_token_ids);
-        result != 0) {
-        return result;
-    }
-    if (const int result = exercise_long_boundary_restore(engine); result != 0) { return result; }
+        const std::vector<ninfer::TokenId> prompt{
+            248045, 846,    198, 109266, 3709,  96220, 117443, 97913,
+            1710,   248046, 198, 248045, 74455, 198,   248068, 198,
+        };
+        if (const int result = exercise_vision_dflash(artifact, prompt); result != 0) {
+            return result;
+        }
 
-    std::cout << "ok\n";
-    return 0;
+        {
+            ninfer::EngineOptions options =
+                dflash_engine_options(artifact, ninfer::ProposalHead::Full, 128);
+            options.max_concurrency = 2;
+            ninfer::Engine full(std::move(options));
+            auto first  = full.submit(full.prepare_tokens(prompt), greedy_options(17, false));
+            auto second = full.submit(full.prepare_tokens(prompt), greedy_options(9, false));
+            const ninfer::GenerationResult first_result  = first.wait();
+            const ninfer::GenerationResult second_result = second.wait();
+            const auto valid = [&](const ninfer::GenerationResult& result, std::size_t count) {
+                return result.generated_token_ids.size() == count &&
+                       result.finish_reason == ninfer::FinishReason::OutputLimit &&
+                       result.speculative.backend == ninfer::SpeculativeBackend::DFlash &&
+                       result.speculative.rounds != 0;
+            };
+            if (!valid(first_result, 17) || !valid(second_result, 9)) {
+                std::cerr << "concurrent full-head DFlash Graph requests did not complete\n";
+                return 1;
+            }
+        }
+
+        {
+            ninfer::Engine engine(
+                dflash_engine_options(artifact, ninfer::ProposalHead::Optimized, 4352));
+            if (const int result = verify_dflash_load(engine); result != 0) { return result; }
+            ninfer::test::speculative_page_boundary(engine);
+            engine.reset_memory_peaks();
+            const ninfer::GenerationResult dflash =
+                engine.generate(engine.prepare_tokens(prompt), greedy_options(24, false));
+            if (dflash.generated_token_ids.size() != 24 ||
+                dflash.finish_reason != ninfer::FinishReason::OutputLimit) {
+                std::cerr << "optimized-head DFlash Graph request did not complete\n";
+                return 1;
+            }
+            const ninfer::MemorySummary memory = engine.memory_summary();
+            if (memory.workspace_logical_peak_bytes == 0 ||
+                memory.workspace_logical_peak_bytes > memory.workspace.capacity_bytes) {
+                std::cerr << "DFlash request did not report a valid planned workspace phase\n";
+                return 1;
+            }
+            if (dflash.speculative.backend != ninfer::SpeculativeBackend::DFlash ||
+                dflash.speculative.rounds == 0) {
+                std::cerr << "DFlash fixture did not execute speculative decode\n";
+                return 1;
+            }
+            if (const int result =
+                    exercise_partial_terminal(engine, prompt, dflash.generated_token_ids);
+                result != 0) {
+                return result;
+            }
+        }
+
+        // Restore fixtures need their own optional cache points. The page-boundary fixture above
+        // leaves reused points that may legitimately win retention under the same slot budget.
+        {
+            ninfer::Engine engine(
+                dflash_engine_options(artifact, ninfer::ProposalHead::Optimized, 4352));
+            if (const int result = exercise_boundary_restore(engine); result != 0) {
+                return result;
+            }
+        }
+        {
+            ninfer::Engine engine(
+                dflash_engine_options(artifact, ninfer::ProposalHead::Optimized, 4352));
+            if (const int result = exercise_long_boundary_restore(engine); result != 0) {
+                return result;
+            }
+        }
+
+        std::cout << "ok\n";
+        return 0;
+    } catch (const std::exception& error) {
+        std::cerr << error.what() << '\n';
+        return 1;
+    }
 }

@@ -1,12 +1,14 @@
 #include "models/qwen3_5/program/program_impl.h"
-#include "models/qwen3_5/program/context_work.h"
-#include "models/qwen3_5/program/context.h"
+#include "models/common/context/work.h"
+#include "models/qwen3_5/program/execution_context.h"
+#include "core/buffer.h"
 #include "models/qwen3_5/execution/linear.h"
 #include "core/startup.h"
 #include "core/device.h"
 #include "ninfer/ops/target_logprobs.h"
 
 #include <algorithm>
+#include <cstdio>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
@@ -22,38 +24,21 @@ namespace ninfer::models::qwen3_5::detail {
 
 static_assert(std::is_nothrow_move_assignable_v<SpeculativeStats>);
 
-namespace {
-
-std::uint32_t normalized_private_capacity(const ContextCacheOptions& options);
-
-std::uint32_t normalized_private_capacity(const ContextCacheOptions& options) {
-    if (!options.max_private_continuations || *options.max_private_continuations == 0) {
-        throw std::logic_error("Qwen3.5 context cache private capacity is not normalized");
-    }
-    return *options.max_private_continuations;
-}
-
-} // namespace
-
 ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const SequencePlanImpl& plan,
                          DeviceContext& device_in, const StartupObserver& startup_observer)
     : parameters(parameters_in), device(device_in), capacity(plan.capacity),
       kv_capacity(plan.kv_capacity), max_concurrency(plan.max_concurrency),
-      context_cache(plan.context_cache),
-      continuation_capacity(normalized_private_capacity(plan.context_cache)),
-      shared_prefix_capacity(plan.context_cache.max_shared_prefixes.value_or(0)),
-      prefill_chunk(plan.prefill_chunk), draft_window(plan.draft_window),
-      speculative_backend(plan.speculative_backend), kv_storage(plan.kv_storage),
-      proposal_head(plan.proposal_head), vision_enabled(plan.features.vision),
-      use_cuda_graph(plan.use_cuda_graph), causal_scoring(plan.causal_scoring),
-      kv_payload_bytes(plan.persistent.kv_payload_bytes),
-      graph_allowance_bytes(plan.graph_allowance_bytes), workspace_plan(plan.workspace),
-      persistent(plan.persistent.bytes), workspace_storage(plan.workspace.capacity),
-      work(DeviceSpan{workspace_storage.base(), plan.workspace.general_capacity}),
-      continuation_states(continuation_capacity), continuation_slots(continuation_capacity),
-      shared_prefix_states(shared_prefix_capacity), shared_prefix_slots(shared_prefix_capacity),
-      round_host(plan.causal_scoring ? std::nullopt
-                                     : std::make_optional<PinnedHostBuffer>(sizeof(TokenId))),
+      context_cache(plan.context_cache), prefill_chunk(plan.prefill_chunk),
+      draft_window(plan.draft_window), speculative_backend(plan.speculative_backend),
+      kv_storage(plan.kv_storage), proposal_head(plan.proposal_head),
+      vision_enabled(plan.features.vision), use_cuda_graph(plan.use_cuda_graph),
+      causal_scoring(plan.causal_scoring), kv_payload_bytes(plan.persistent.kv_payload_bytes),
+      workspace_plan(plan.workspace), persistent(device.device(), plan.persistent.bytes),
+      workspace_storage(device.device(), plan.workspace.capacity),
+      work(workspace_storage.span().subspan(0, plan.workspace.general_capacity)),
+      round_host(plan.causal_scoring
+                     ? std::nullopt
+                     : std::make_optional<PinnedHostBuffer>(sizeof(qwen3_5::PrefillRoundHost))),
       score_logprobs_host(plan.causal_scoring ? std::make_optional<PinnedHostBuffer>(
                                                     kCausalScoreTile * sizeof(float))
                                               : std::nullopt),
@@ -68,13 +53,11 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
                    : std::nullopt),
       dflash_host(is_masked_draft_backend(plan.speculative_backend)
                       ? std::make_optional<PinnedHostBuffer>(sizeof(qwen3_5::DFlashDecodeIngress) +
-                                                             sizeof(qwen3_5::DFlashDecodeEgress))
+                                                             sizeof(qwen3_5::DFlashDecodeEgress) +
+                                                             sizeof(qwen3_5::DFlashPrefillIngress))
                       : std::nullopt),
-      context_source_ready_(device_in), context_completion_(device_in),
-      context_transfer_timers_{CudaEventTimer(device_in, device_in.transfer_stream),
-                               CudaEventTimer(device_in, device_in.transfer_stream),
-                               CudaEventTimer(device_in, device_in.transfer_stream)} {
-    if (&parameters != plan.parameters || parameters.model.options() != plan.features) {
+      prefill_gpu_timer_(device_in) {
+    if (parameters.profile != plan.profile || parameters.model.options() != plan.features) {
         throw std::invalid_argument("Program parameters do not match the frozen sequence plan");
     }
     if (workspace_plan.general_capacity == 0 ||
@@ -85,136 +68,88 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
          workspace_plan.vision->general_capacity_bytes != workspace_plan.general_capacity)) {
         throw std::invalid_argument("Qwen3.5 workspace plan does not match startup features");
     }
-    const DeviceSpan backing = persistent.alloc_bytes(plan.persistent.bytes, 256);
-    if (!plan.context_cache.max_private_continuations || !plan.context_cache.max_shared_prefixes) {
-        throw std::logic_error("Qwen3.5 context cache options are not normalized");
-    }
-    const std::uint64_t address_capacity64 =
-        static_cast<std::uint64_t>(*plan.context_cache.max_private_continuations) +
-        *plan.context_cache.max_shared_prefixes;
-    if (address_capacity64 == 0 || address_capacity64 > std::numeric_limits<std::uint32_t>::max()) {
-        throw std::overflow_error("Qwen3.5 KV address-space capacity exceeds uint32");
-    }
-    // One unpublished descriptor is reserved for the single in-flight active-capture snapshot.
-    // Published private/shared address spaces remain bounded by P + S; the transaction slot lets a
-    // full shared catalog replace one entry without releasing the old checkpoint before the new
-    // snapshot has been prepared.
-    if (address_capacity64 == std::numeric_limits<std::uint32_t>::max()) {
-        throw std::overflow_error("Qwen3.5 KV transaction address capacity exceeds uint32");
-    }
-    const auto address_capacity      = static_cast<std::uint32_t>(address_capacity64 + 1U);
-    const auto logical_page_capacity = [&](const DeviceKVPagePool& pool) {
-        const HostKVPageLayout host_layout = plan_host_kv_page_layout(pool.geometry());
-        const std::uint64_t host_pages =
-            plan.context_cache.host_kv_capacity_bytes / host_layout.page_stride;
-        const std::uint64_t total = static_cast<std::uint64_t>(pool.capacity_pages()) + host_pages;
-        if (total > std::numeric_limits<std::uint32_t>::max()) {
-            throw std::overflow_error("Qwen3.5 logical KV page capacity exceeds uint32");
-        }
-        return static_cast<std::uint32_t>(total);
-    };
-
-    decoder = std::make_unique<qwen3_5::DecoderState>(backing, plan.persistent.decoder);
-    text_host_kv_page_stride =
-        plan_host_kv_page_layout(decoder->text_kv.page_pool().geometry()).page_stride;
-    text_kv_pages = std::make_unique<LogicalKVPageStore>(
-        decoder->text_kv.page_pool(), logical_page_capacity(decoder->text_kv.page_pool()));
-    text_kv_addresses = std::make_unique<KVAddressSpaceStore>(
-        *text_kv_pages, decoder->text_kv.execution_tables(), address_capacity,
-        decoder->text_kv.execution_tables().logical_page_capacity());
-    state_images =
-        std::make_unique<qwen3_5::StateImageDevicePool>(backing, plan.persistent.state_images);
-    if (plan.context_cache.host_state_slots != 0) {
-        const std::uint64_t host_state_bytes =
-            static_cast<std::uint64_t>(state_images->host_layout().image_bytes) *
-            plan.context_cache.host_state_slots;
-        StartupPhaseScope host_state_phase(startup_observer, StartupPhase::HostStatePin,
-                                           StartupProgressUnit::Bytes, host_state_bytes);
-        host_state_images = std::make_unique<qwen3_5::HostStatePool>(
-            state_images->host_layout(), plan.context_cache.host_state_slots);
-        host_state_phase.complete(host_state_bytes, host_state_bytes);
-    }
-    const std::uint64_t logical_state_capacity =
-        static_cast<std::uint64_t>(state_images->slot_count()) +
-        plan.context_cache.host_state_slots;
-    if (logical_state_capacity > std::numeric_limits<std::uint32_t>::max()) {
-        throw std::overflow_error("Qwen3.5 logical StateImage capacity exceeds uint32");
-    }
-    state_store = std::make_unique<StateImageStore>(
-        *state_images, host_state_images.get(), static_cast<std::uint32_t>(logical_state_capacity));
-    pressure_private_owner_scratch_.resize(continuation_capacity);
-    pressure_shared_owner_scratch_.resize(shared_prefix_capacity);
-    pressure_private_drop_scratch_.resize(continuation_capacity);
-    const std::size_t pressure_checkpoint_capacity =
-        2U + context_cache.max_long_anchors_per_continuation.value_or(0U);
-    for (auto& dropped : pressure_private_drop_scratch_) {
-        dropped.reserve(pressure_checkpoint_capacity);
-    }
-    pressure_state_scratch_.reserve(static_cast<std::size_t>(logical_state_capacity));
+    const MemorySpan backing = persistent.span();
+    decoder      = std::make_unique<qwen3_5::DecoderState>(backing, plan.persistent.decoder);
+    state_images = std::make_unique<StateImageViews>(backing, plan.persistent.state_images);
     if (plan.persistent.replay_records) {
         replay_records.emplace(backing, *plan.persistent.replay_records);
         replay_fold.emplace(*replay_records, state_images->linear().all_layers_view());
     }
-    if (replay_records.has_value() != (speculative_backend != SpeculativeBackend::None) ||
-        replay_fold.has_value() != replay_records.has_value()) {
-        throw std::logic_error("ReplaySSM records do not match the sequence plan");
-    }
     if (plan.persistent.dflash) {
-        CyclicKVCache* local = state_images->dflash_local();
-        if (local == nullptr) {
-            throw std::logic_error("DFlash StateImage has no local fixed state");
-        }
+        auto* local = state_images->dflash_local();
+        if (!local) { throw std::logic_error("DFlash StateImage has no local state"); }
         dflash.emplace(backing, *plan.persistent.dflash, *local);
     }
-    if (dflash.has_value() != plan.features.masked_draft()) {
-        throw std::logic_error("DFlash state does not match the frozen sequence plan");
+    const auto host_bytes = plan.context_cache.host_capacity_bytes.value();
+    std::vector<HostKVPageLayout> layouts{
+        plan_host_kv_page_layout(decoder->text_kv.page_pool().geometry())};
+    text_host_kv_page_stride = layouts.front().page_stride;
+    if (const auto* backend = backend_kv_cache()) {
+        auto layout                 = plan_host_kv_page_layout(backend->page_pool().geometry());
+        backend_host_kv_page_stride = layout.page_stride;
+        if (layout != layouts.front()) { layouts.push_back(std::move(layout)); }
     }
-    if (qwen3_5::PagedKVCache* backend = backend_kv_cache()) {
-        backend_host_kv_page_stride =
-            plan_host_kv_page_layout(backend->page_pool().geometry()).page_stride;
-        backend_kv_pages = std::make_unique<LogicalKVPageStore>(
-            backend->page_pool(), logical_page_capacity(backend->page_pool()));
-        backend_kv_addresses = std::make_unique<KVAddressSpaceStore>(
-            *backend_kv_pages, backend->execution_tables(), address_capacity,
-            backend->execution_tables().logical_page_capacity());
+    std::size_t minimum_stride    = state_images->storage().image_bytes();
+    std::size_t minimum_kv_stride = layouts.front().page_stride;
+    for (const auto& layout : layouts) {
+        minimum_stride    = std::min(minimum_stride, layout.page_stride);
+        minimum_kv_stride = std::min(minimum_kv_stride, layout.page_stride);
     }
-    pressure_text_page_scratch_.resize(text_kv_pages->capacity());
-    pressure_text_selected_pages_.reserve(text_kv_pages->capacity());
+    const auto checked_count = [](std::uint64_t value) {
+        if (value > std::numeric_limits<std::uint32_t>::max()) {
+            throw std::overflow_error("context resource descriptor capacity exceeds uint32");
+        }
+        return static_cast<std::uint32_t>(value);
+    };
+    const auto logical_states = checked_count(state_images->storage().slot_count() +
+                                              host_bytes / state_images->storage().image_bytes());
+    // One immutable image can serve private replay, an explicit anchor, a public view and an
+    // exact-hit endpoint. Alias descriptors are bounded separately from physical state slots.
+    checkpoints.resize(checked_count(4ULL * logical_states + 2ULL * max_concurrency));
+    const auto history_capacity = checked_count(checkpoints.size() + max_concurrency + 2U);
+    if (host_bytes) {
+        StartupPhaseScope phase(startup_observer, StartupPhase::HostContextPin,
+                                StartupProgressUnit::Bytes, host_bytes);
+        host_context_arena = std::make_unique<HostContextArena>(host_bytes, minimum_stride);
+        host_kv_arena      = std::make_unique<HostKVArena>(*host_context_arena, layouts);
+        const auto extents = checked_count(host_bytes / minimum_kv_stride);
+        if (extents) {
+            host_kv_extents = std::make_unique<context::HostKVExtentStore>(*host_kv_arena, extents);
+        }
+        phase.complete(host_bytes, host_bytes);
+    }
+    state_store              = std::make_unique<StateImageStore>(state_images->storage(),
+                                                                 host_context_arena.get(), logical_states);
+    const auto logical_pages = [&](const DeviceKVPagePool& pool) {
+        const auto stride = plan_host_kv_page_layout(pool.geometry()).page_stride;
+        return checked_count(pool.capacity_pages() + host_bytes / stride);
+    };
+    text_kv_pages = std::make_unique<context::LogicalKVPageStore>(
+        decoder->text_kv.page_pool(), logical_pages(decoder->text_kv.page_pool()));
+    text_kv_histories = std::make_unique<context::KVHistoryStore>(
+        *text_kv_pages, decoder->text_kv.execution_tables(), history_capacity,
+        decoder->text_kv.execution_tables().logical_page_capacity(), host_kv_extents.get());
+    if (auto* backend = backend_kv_cache()) {
+        backend_kv_pages = std::make_unique<context::LogicalKVPageStore>(
+            backend->page_pool(), logical_pages(backend->page_pool()));
+        backend_kv_histories = std::make_unique<context::KVHistoryStore>(
+            *backend_kv_pages, backend->execution_tables(), history_capacity,
+            backend->execution_tables().logical_page_capacity(), host_kv_extents.get());
+    }
+
+    const auto register_pool = [&](runtime::KvPoolId id, std::string_view label,
+                                   const DeviceKVPagePool& pool, std::size_t host_stride) {
+        kv_pools.push_back({id, label, &pool.geometry(), pool.capacity_pages(),
+                            pool.device_copy_work(1).payload_bytes, host_stride});
+    };
+    register_pool(kTextKvPool, "text", text_kv_pages->physical_pool(), text_host_kv_page_stride);
     if (backend_kv_pages) {
-        pressure_backend_page_scratch_.resize(backend_kv_pages->capacity());
-        pressure_backend_selected_pages_.reserve(backend_kv_pages->capacity());
+        register_pool(kBackendKvPool,
+                      speculative_backend == SpeculativeBackend::Mtp ? "mtp" : "draft_full",
+                      backend_kv_pages->physical_pool(), backend_host_kv_page_stride);
     }
-    if (plan.context_cache.host_kv_capacity_bytes != 0) {
-        std::vector<HostKVPageLayout> layouts;
-        layouts.push_back(plan_host_kv_page_layout(decoder->text_kv.page_pool().geometry()));
-        if (const qwen3_5::PagedKVCache* backend = backend_kv_cache()) {
-            HostKVPageLayout backend_layout =
-                plan_host_kv_page_layout(backend->page_pool().geometry());
-            if (backend_layout != layouts.front()) { layouts.push_back(std::move(backend_layout)); }
-        }
-        StartupPhaseScope host_kv_phase(
-            startup_observer, StartupPhase::HostKvPin, StartupProgressUnit::Bytes,
-            static_cast<std::uint64_t>(plan.context_cache.host_kv_capacity_bytes));
-        host_kv_arena = std::make_unique<HostKVArena>(
-            plan.context_cache.host_kv_capacity_bytes,
-            std::span<const HostKVPageLayout>(layouts.data(), layouts.size()));
-        host_kv_phase.complete(
-            static_cast<std::uint64_t>(plan.context_cache.host_kv_capacity_bytes),
-            static_cast<std::uint64_t>(plan.context_cache.host_kv_capacity_bytes));
-        std::size_t minimum_stride = layouts.front().page_stride;
-        for (const HostKVPageLayout& layout : layouts) {
-            minimum_stride = std::min(minimum_stride, layout.page_stride);
-        }
-        const std::size_t extent_capacity =
-            plan.context_cache.host_kv_capacity_bytes / minimum_stride;
-        if (extent_capacity > std::numeric_limits<std::uint32_t>::max()) {
-            throw std::overflow_error("Qwen3.5 Host KV extent capacity exceeds uint32");
-        }
-        if (extent_capacity != 0) {
-            host_kv_extents = std::make_unique<HostKVExtentStore>(
-                *host_kv_arena, static_cast<std::uint32_t>(extent_capacity));
-        }
-    }
+
+    migration_context_.emplace(device, kv_pools.size());
 
     io = qwen3_5::RoundState(backing, plan.persistent.round);
     if (io.mtp.has_value() != (speculative_backend == SpeculativeBackend::Mtp)) {
@@ -243,25 +178,20 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
     if (plan.persistent.sampling_config) {
         sampling_config = plan.persistent.sampling_config->bind(backing);
     }
-    active_continuations.fill(continuation_capacity);
-    for (std::uint32_t lane = 0; lane < max_concurrency; ++lane) { lane_epochs[lane] = 1; }
-    for (std::uint32_t index = 0; index < continuation_capacity; ++index) {
-        SequenceState& sequence = continuation_states[index];
-        sequence.ledger.reserve(static_cast<std::size_t>(capacity) + 1ULL);
-        sequence.prefix_identity.reserve(static_cast<std::size_t>(capacity) + 1ULL);
-        sequence.prefix_digests.reserve(static_cast<std::size_t>(capacity) + 1ULL);
-        sequence.long_anchors.reserve(context_cache.max_long_anchors_per_continuation.value_or(0));
-        // One retained shared resume source can coexist with every fixed per-request candidate.
-        sequence.shared_prefix_references.reserve(8U);
+    if (plan.persistent.grammar_masks) {
+        grammar_masks_device = plan.persistent.grammar_masks->bind(backing);
+        grammar_masks_host.emplace(grammar_masks_device.bytes());
     }
-    materialization_ledger_.reserve(static_cast<std::size_t>(capacity) + 1ULL);
-    materialization_identity_.reserve(static_cast<std::size_t>(capacity) + 1ULL);
-    materialization_prefix_digests_.reserve(static_cast<std::size_t>(capacity) + 1ULL);
-
-    set_device_i32(io.text_kv_table_row, 0);
-    if (!causal_scoring) { set_device_i32(io.backend_kv_table_row, 0); }
-
-    host_tokens = round_host ? static_cast<TokenId*>(round_host->data()) : nullptr;
+    if (is_masked_draft_backend(speculative_backend)) {
+        dflash_draft_handoff.emplace(device, draft_window * max_concurrency);
+    }
+    for (std::uint32_t lane = 0; lane < max_concurrency; ++lane) {
+        lane_epochs[lane]    = 1;
+        sequences[lane].lane = lane;
+    }
+    host_tokens = round_host
+                      ? &static_cast<qwen3_5::PrefillRoundHost*>(round_host->data())->sampled_token
+                      : nullptr;
     if (ordinary_host) {
         ordinary_host_ingress = static_cast<qwen3_5::OrdinaryDecodeIngress*>(ordinary_host->data());
         ordinary_host_egress  = reinterpret_cast<qwen3_5::OrdinaryDecodeEgress*>(
@@ -282,40 +212,80 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
         dflash_host_egress  = reinterpret_cast<qwen3_5::DFlashDecodeEgress*>(
             static_cast<unsigned char*>(dflash_host->data()) +
             sizeof(qwen3_5::DFlashDecodeIngress));
-        *dflash_host_ingress = {};
-        *dflash_host_egress  = {};
+        *dflash_host_ingress        = {};
+        *dflash_host_egress         = {};
+        dflash_prefill_host_ingress = reinterpret_cast<qwen3_5::DFlashPrefillIngress*>(
+            static_cast<unsigned char*>(dflash_host->data()) +
+            sizeof(qwen3_5::DFlashDecodeIngress) + sizeof(qwen3_5::DFlashDecodeEgress));
+        *dflash_prefill_host_ingress = {};
     }
-    if (io.dflash_prefill) {
-        CUDA_CHECK(cudaMemsetAsync(io.dflash_prefill->produced_count.data, 0,
-                                   io.dflash_prefill->produced_count.bytes(), device.stream));
-    }
-    CUDA_CHECK(cudaMemsetAsync(io.rope_delta.data, 0, io.rope_delta.bytes(), device.stream));
+    CUDA_CHECK(cudaMemsetAsync(io.rope_delta.data, 0, io.rope_delta.bytes(), device.stream()));
     if (io.mtp) {
         CUDA_CHECK(
-            cudaMemsetAsync(io.mtp->position.data, 0, io.mtp->position.bytes(), device.stream));
+            cudaMemsetAsync(io.mtp->position.data, 0, io.mtp->position.bytes(), device.stream()));
     }
     if (!causal_scoring) {
-        CUDA_CHECK(cudaMemsetAsync(token_counts.data, 0, token_counts.bytes(), device.stream));
+        CUDA_CHECK(cudaMemsetAsync(token_counts.data, 0, token_counts.bytes(), device.stream()));
         CUDA_CHECK(
-            cudaMemsetAsync(sampling_config.data, 0, sampling_config.bytes(), device.stream));
+            cudaMemsetAsync(sampling_config.data, 0, sampling_config.bytes(), device.stream()));
+    }
+    if (plan.moe) {
+        std::vector<const moe::Parameters*> layers;
+        for (const auto& block : parameters.text.layers) {
+            if (const auto* layer = std::get_if<moe::Parameters>(&block.ffn))
+                layers.push_back(layer);
+        }
+        moe = std::make_unique<moe::Resources>(
+            plan.moe, layers, parameters.model.expert_banks(), device,
+            plan.graph_probe ? moe::ResourcePurpose::GraphCalibration
+                             : moe::ResourcePurpose::Execution);
     }
     device.synchronize();
-    if (use_cuda_graph) {
-        StartupPhaseScope graph_phase(startup_observer, StartupPhase::CudaGraphPrepare);
-        prepare_graphs();
-        graph_phase.complete();
-    }
+
     work.reset();
     work.reset_peak();
     workspace_logical_peak_bytes = 0;
 }
 
-ProgramImpl::~ProgramImpl() noexcept {
-    if (device.transfer_stream != nullptr) { (void)cudaStreamSynchronize(device.transfer_stream); }
-    if (device.stream != nullptr) { (void)cudaStreamSynchronize(device.stream); }
+void ProgramImpl::initialize_graphs() {
+    if (!use_cuda_graph) return;
+    device.synchronize();
+    const auto before = device_memory_snapshot(device.device());
+    prepare_graphs();
+    device.synchronize();
+    graph_memory = GraphMemorySummary{.preparation_increment_bytes = device_memory_growth(
+                                          before, device_memory_snapshot(device.device()))};
+    work.reset();
+    work.reset_peak();
+    workspace_logical_peak_bytes = 0;
 }
 
-std::vector<float> ProgramImpl::causal_score(PreparedPromptData&& prompt,
+void ProgramImpl::release_graphs() {
+    if (moe) moe->synchronize();
+    CUDA_CHECK(cudaStreamSynchronize(device.transfer_stream()));
+    device.synchronize();
+    ordinary_graphs            = {};
+    speculative_forward_graphs = {};
+    speculative_finish_graphs  = {};
+}
+
+ProgramImpl::~ProgramImpl() noexcept {
+    if (moe) {
+        try {
+            moe->synchronize();
+        } catch (const std::exception& error) {
+            std::fprintf(stderr, "MoE teardown synchronization: %s\n", error.what());
+        }
+    }
+    if (device.transfer_stream() != nullptr) (void)cudaStreamSynchronize(device.transfer_stream());
+    if (device.stream() != nullptr) (void)cudaStreamSynchronize(device.stream());
+    ordinary_graphs            = {};
+    speculative_forward_graphs = {};
+    speculative_finish_graphs  = {};
+    moe.reset();
+}
+
+std::vector<float> ProgramImpl::causal_score(qwen::PreparedPromptData&& prompt,
                                              std::uint32_t first_target) {
     if (!causal_scoring || !score_hidden || !score_logprobs_host ||
         workspace_plan.causal_score == 0) {
@@ -339,18 +309,14 @@ std::vector<float> ProgramImpl::causal_score(PreparedPromptData&& prompt,
     const auto token_count                     = static_cast<std::uint32_t>(token_count_size);
     const std::uint32_t predictor_count        = token_count - 1U;
     const std::uint32_t scored_predictor_begin = first_target - 1U;
-    const std::uint32_t entitlement            = kv_pages_for_frontier(predictor_count);
-    if (entitlement == 0) { throw std::logic_error("causal score has no KV entitlement"); }
+    const std::uint32_t required_pages         = context::kv_pages_for_frontier(predictor_count);
+    if (required_pages == 0) { throw std::logic_error("causal score requires KV pages"); }
 
     std::optional<StateImageHandle> state;
-    std::optional<KVAddressSpaceHandle> address;
+    std::optional<context::KVHistory> address;
     const auto cleanup = [&] {
         bool released = true;
-        if (address) {
-            if (text_kv_addresses->active(*address)) { text_kv_addresses->deactivate(*address); }
-            released = text_kv_addresses->release(*address) && released;
-            address.reset();
-        }
+        address.reset();
         if (state) {
             released = state_store->release(*state) && released;
             state.reset();
@@ -365,17 +331,20 @@ std::vector<float> ProgramImpl::causal_score(PreparedPromptData&& prompt,
     std::uint32_t staged_columns = 0;
 
     try {
-        state = state_store->reserve_reset(device.stream);
+        state = state_store->reserve_destination();
         if (!state) { throw std::bad_alloc(); }
-        address = text_kv_addresses->create_active(entitlement, 0);
-        if (!address) { throw std::bad_alloc(); }
-        if (text_kv_addresses->bound_row(*address) != 0) {
-            throw std::logic_error("causal score did not bind the unique Main KV row");
-        }
-        text_kv_addresses->ensure_mapped_to_tokens(*address, predictor_count, device.stream);
+        state_images->storage().clear(state_store->physical_slot(*state), device.execution_view());
+        state_store->complete_initialization(*state);
+        auto binding = text_kv_histories->prepare_binding(nullptr, 0, predictor_count, 0);
+        binding.publish_restores();
+        binding.prepare_tail_copy();
+        binding.enqueue_mapping(device.stream());
+        address.emplace(binding.commit());
+        text_kv_histories->prepare_write(*address, 0, predictor_count, device.stream());
 
         const std::int32_t state_slot = state_store->physical_slot(*state);
-        const auto flush              = [&] {
+
+        const auto flush = [&] {
             if (staged_columns == 0) { return; }
             if (staged_columns != staged_targets.size() || staged_columns > kCausalScoreTile) {
                 throw std::logic_error("causal score staging has an invalid shape");
@@ -385,17 +354,18 @@ std::vector<float> ProgramImpl::causal_score(PreparedPromptData&& prompt,
             const auto columns = static_cast<std::int32_t>(staged_columns);
             Tensor logits      = work.alloc(
                 DType::BF16, {dimension(parameters.model.config().text.vocab_size), columns});
-            Tensor target_ids = work.alloc(DType::I32, {columns});
-            Tensor logprobs   = work.alloc(DType::FP32, {columns});
-            Tensor hidden     = score_hidden->slice(1, 0, columns);
-            execution::project(hidden, parameters.text.output_head, logits, work, device.stream);
+            Tensor target_ids        = work.alloc(DType::I32, {columns});
+            Tensor logprobs          = work.alloc(DType::FP32, {columns});
+            Tensor hidden            = score_hidden->slice(1, 0, columns);
+            const auto public_tokens = dimension(parameters.model.resources().public_token_count);
+            execution::project(hidden, parameters.text.output_head, logits, work,
+                               device.execution_view());
             CUDA_CHECK(cudaMemcpyAsync(target_ids.data, staged_targets.data(), target_ids.bytes(),
-                                                    cudaMemcpyHostToDevice, device.stream));
-            ops::target_logprobs(logits, target_ids,
-                                              dimension(parameters.model.resources().public_token_count),
-                                              logprobs, device.stream);
+                                       cudaMemcpyHostToDevice, device.stream()));
+            ops::target_logprobs(logits, target_ids, public_tokens, logprobs,
+                                 device.execution_view());
             CUDA_CHECK(cudaMemcpyAsync(score_logprobs_host->data(), logprobs.data, logprobs.bytes(),
-                                                    cudaMemcpyDeviceToHost, device.stream));
+                                       cudaMemcpyDeviceToHost, device.stream()));
             device.synchronize();
             const auto* host = static_cast<const float*>(score_logprobs_host->data());
             output.insert(output.end(), host, host + staged_columns);
@@ -409,8 +379,7 @@ std::vector<float> ProgramImpl::causal_score(PreparedPromptData&& prompt,
             const std::uint32_t nominal = std::min(prefill_chunk, predictor_count - cursor);
             execution::PrefillContext schedule_state{
                 {device, parameters, work, state_images->linear(), nullptr, io, prefill_hidden,
-                 prefill_chunk, proposal_head},
-                decoder->text_kv.execution_view(text_kv_addresses->execution_row(*address)),
+                 prefill_chunk, proposal_head, moe.get()},
                 {},
                 decoder->text_kv,
                 nullptr,
@@ -420,6 +389,7 @@ std::vector<float> ProgramImpl::causal_score(PreparedPromptData&& prompt,
                 nullptr,
                 state_slot,
                 state_slot,
+                0,
                 0,
                 nullptr};
             mark_workspace_usage(workspace_plan.text_prefill);
@@ -432,7 +402,7 @@ std::vector<float> ProgramImpl::causal_score(PreparedPromptData&& prompt,
             }
             const std::uint32_t chunk_begin = cursor;
             cursor += result.processed_tokens;
-            text_kv_addresses->commit_frontier(*address, cursor);
+            text_kv_histories->commit_frontier(address->handle(), cursor);
 
             std::uint32_t selected = std::max(chunk_begin, scored_predictor_begin);
             while (selected < cursor) {
@@ -445,7 +415,7 @@ std::vector<float> ProgramImpl::causal_score(PreparedPromptData&& prompt,
                 Tensor destination = score_hidden->slice(
                     1, static_cast<std::int32_t>(staged_columns), static_cast<std::int32_t>(count));
                 CUDA_CHECK(cudaMemcpyAsync(destination.data, source.data, source.bytes(),
-                                           cudaMemcpyDeviceToDevice, device.stream));
+                                           cudaMemcpyDeviceToDevice, device.stream()));
                 for (std::uint32_t column = 0; column < count; ++column) {
                     staged_targets.push_back(prompt.token_ids[selected + column + 1U]);
                 }
@@ -472,52 +442,53 @@ std::vector<float> ProgramImpl::causal_score(PreparedPromptData&& prompt,
     }
 }
 
-void ProgramImpl::start_context_transfer_timer(runtime::ContextResourceClass resource) {
-    context_transfer_timers_[context_resource_index(resource)].start();
-}
-
-void ProgramImpl::stop_context_transfer_timer(runtime::ContextResourceClass resource) {
-    context_transfer_timers_[context_resource_index(resource)].record_stop();
-}
-
-runtime::ContextTransferObservation ProgramImpl::context_transfer_observation(
-    runtime::ContextResourceClass resource, runtime::ContextTransferDirection direction,
-    TransferWork work, std::uint32_t page_count, std::uint64_t state_images) const {
-    const double elapsed_ns =
-        static_cast<double>(
-            context_transfer_timers_[context_resource_index(resource)].elapsed_ms()) *
-        1'000'000.0;
-    const std::uint64_t measured_ns =
-        elapsed_ns >= static_cast<double>(std::numeric_limits<std::uint64_t>::max())
-            ? std::numeric_limits<std::uint64_t>::max()
-            : std::max<std::uint64_t>(1, static_cast<std::uint64_t>(elapsed_ns + 0.5));
-    return runtime::ContextTransferObservation{
-        .resource  = resource,
-        .direction = direction,
-        .units =
-            resource == runtime::ContextResourceClass::State ? state_images : work.payload_bytes,
-        .page_count = page_count,
-        .work       = work,
-        .elapsed_ns = measured_ns,
-    };
-}
-
-MemorySummary ProgramImpl::memory_summary() const noexcept {
-    MemorySummary out;
-    out.device          = device.device;
-    out.max_context     = capacity;
-    out.kv_capacity     = kv_capacity;
-    out.kv_cache        = kv_storage;
+MemorySummary ProgramImpl::memory_summary() const {
     const auto& weights = parameters.model.storage_stats();
-    out.weights = ArenaMemorySummary{weights.device_capacity_bytes, weights.device_capacity_bytes,
+    MemorySummary out;
+    out.device        = device.device().index();
+    out.max_context   = capacity;
+    out.prefill_chunk = prefill_chunk;
+    if (moe) {
+        const auto& plan = moe->plan();
+        MoeMemorySummary summary;
+        summary.host_weights_bytes    = weights.host_capacity_bytes;
+        summary.registered_host_bytes = weights.registered_host_bytes;
+        summary.cache_bytes           = plan.cache.config.capacity_bytes;
+        summary.fixed_bytes           = plan.cache.config.fixed_bytes;
+        summary.window_bytes          = summary.cache_bytes - summary.fixed_bytes;
+        summary.window_count          = plan.window_count;
+        const auto usage              = moe->cache_usage();
+        summary.used_bytes            = usage.used_bytes;
+        summary.target_bytes          = plan.target_bytes;
+        summary.ready_bytes           = usage.ready_cache_bytes;
+        summary.cpu_workers           = static_cast<std::uint32_t>(plan.team.worker_cpus.size());
+        for (const auto& layer : plan.layers) {
+            summary.fixed_experts_per_layer.push_back(layer.fixed_experts);
+            summary.target_experts_per_layer.push_back(layer.cache_experts);
+            summary.ready_experts_per_layer.push_back(
+                usage.ready_experts_per_bank.at(layer.spec.bank.index));
+        }
+        summary.bridge_device_bytes = plan.bridge.device_frame_bytes;
+        summary.bridge_pinned_bytes = plan.bridge.pinned_frame_bytes;
+        summary.cpu_workspace_bytes = plan.bridge.cpu_workspace_bytes;
+        summary.uploaded_bytes      = moe->uploaded_bytes();
+        summary.prefetched_bytes    = usage.prefetched_bytes;
+        out.moe                     = std::move(summary);
+    }
+    out.kv_capacity = kv_capacity;
+    out.kv_cache    = kv_storage;
+    out.weights  = ArenaMemorySummary{weights.device_capacity_bytes, weights.device_capacity_bytes,
                                      weights.device_capacity_bytes};
-    out.sequence =
-        ArenaMemorySummary{persistent.capacity(), persistent.used(), persistent.peak_used()};
+    out.sequence = ArenaMemorySummary{persistent.size(), persistent.size(), persistent.size()};
     std::size_t active_handoff_bytes = 0;
     for (const RequestControl& request : requests) {
         if (request.prefill && request.prefill->vision) {
             active_handoff_bytes =
                 std::max(active_handoff_bytes, request.prefill->vision->active_handoff_bytes());
+        }
+        if (request.replay && request.replay->vision) {
+            active_handoff_bytes =
+                std::max(active_handoff_bytes, request.replay->vision->active_handoff_bytes());
         }
     }
     std::size_t active_workspace_bytes = work.used();
@@ -526,12 +497,12 @@ MemorySummary ProgramImpl::memory_summary() const noexcept {
             std::max(active_workspace_bytes,
                      workspace_plan.vision->handoff_offset_bytes + active_handoff_bytes);
     }
-    out.workspace = ArenaMemorySummary{workspace_storage.capacity(), active_workspace_bytes,
+    out.workspace = ArenaMemorySummary{workspace_storage.size(), active_workspace_bytes,
                                        std::max(work.peak_used(), workspace_logical_peak_bytes)};
     if (workspace_plan.vision) {
         out.vision_workspace = VisionWorkspaceMemorySummary{
             .aggregate_prompt_tokens = static_cast<std::uint32_t>(
-                std::min<std::uint64_t>(capacity, kMaximumPromptVisionTokens)),
+                std::min<std::uint64_t>(capacity, qwen::kMaximumPromptVisionTokens)),
             .max_item_tokens        = workspace_plan.vision->max_merged_tokens,
             .general_capacity_bytes = workspace_plan.vision->general_capacity_bytes,
             .encode_peak_bytes      = workspace_plan.vision->encode_peak_bytes,
@@ -542,27 +513,29 @@ MemorySummary ProgramImpl::memory_summary() const noexcept {
         };
     }
     out.workspace_logical_peak_bytes = workspace_logical_peak_bytes;
-    out.cuda_graph_allowance_bytes   = graph_allowance_bytes;
+    out.cuda_graph                   = graph_memory;
     out.kv_payload_bytes             = kv_payload_bytes;
-    if (host_state_images) {
-        out.host_state_capacity_slots = host_state_images->capacity();
-        out.host_state_occupied_slots = host_state_images->occupied();
-    }
-    if (host_kv_arena) {
-        out.host_kv_capacity_bytes = host_kv_arena->capacity_bytes();
-        out.host_kv_occupied_bytes = host_kv_arena->occupied_bytes();
+    out.host_state_occupied_slots    = state_store->host_occupied();
+    if (host_kv_arena) { out.host_kv_occupied_bytes = host_kv_arena->occupied_bytes(); }
+    if (host_context_arena) {
+        out.host_context_capacity_bytes = host_context_arena->capacity_bytes();
+        out.host_context_occupied_bytes = host_context_arena->occupied_bytes();
+        out.host_context_reserved_bytes = host_context_arena->reserved_bytes();
     }
     return out;
 }
 
 void ProgramImpl::reset_memory_peaks() noexcept {
-    persistent.reset_peak();
     work.reset_peak();
     std::size_t active_handoff_bytes = 0;
     for (const RequestControl& request : requests) {
         if (request.prefill && request.prefill->vision) {
             active_handoff_bytes =
                 std::max(active_handoff_bytes, request.prefill->vision->active_handoff_bytes());
+        }
+        if (request.replay && request.replay->vision) {
+            active_handoff_bytes =
+                std::max(active_handoff_bytes, request.replay->vision->active_handoff_bytes());
         }
     }
     vision_handoff_peak_bytes    = active_handoff_bytes;
@@ -573,6 +546,5 @@ void ProgramImpl::reset_memory_peaks() noexcept {
                      workspace_plan.vision->handoff_offset_bytes + active_handoff_bytes);
     }
 }
-
 
 } // namespace ninfer::models::qwen3_5::detail

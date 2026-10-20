@@ -101,7 +101,7 @@ A simple split at the middle of the source matrix would change the model.
 The Dense groupwise attention recipe packs Q/K into Q4 and gate/V into Q5. A supported FP8 or NVFP4
 recipe can pack their union into one parent. The same four logical roles then become either the
 two-weight or one-weight native fused call. Dense gate/up and MoE expert banks follow their finite
-packing and execution rules. [Storage layouts](storage-layouts.md#8-logical-views-and-native-operands)
+packing and execution rules. [Storage layouts](storage-layouts.md#9-logical-views-and-native-operands)
 describes the difference between logical views and native operand restrictions.
 
 `tie_word_embeddings` records a training relationship; bindings choose whether physical data is
@@ -213,6 +213,11 @@ The shared expert always executes and is outside top-k. Logical expert id e iden
 and the corresponding expert matrices. Physical bank ordering and fused dispatch preserve that
 relationship. Router loss coefficients and training-only outputs add no inference term.
 
+[Expert weight cache design](expert-weight-cache.md) specifies the planned 35B-A3B offload
+container and loading split: sufficient VRAM retains direct GPU materialization and the existing
+fused path; only the offload route establishes complete Host expert backing. It does not change
+the current all-device capability or the MoE formula above.
+
 ## Prefill, decode and MTP
 
 Text prefill gathers embedding columns, replaces media placeholders with Vision outputs, and runs
@@ -305,8 +310,9 @@ The official tokenizer has 248,077 addressable IDs within 248,320 matrix rows. R
 rows are not assumed zero and do not become public tokens.
 
 Token spelling, special-token roles and EOS are derived from loaded resources. The frontend checks
-the tokenizer's supported BPE/normalization semantics and token-domain agreement. Template bytes
-select a compiled Qwen template; arbitrary Jinja execution is not implemented. Mode sampling
+the tokenizer's supported BPE/normalization semantics and token-domain agreement. The Frontend
+compiles the artifact or startup-selected Jinja template and derives exact reuse boundaries from
+its rendered token sequence. Mode sampling
 presets are architecture-owned, with explicit application/request overrides. Resource loading
 does not infer execution identity from tokenizer filenames, release names or sampling values.
 
@@ -315,7 +321,7 @@ does not infer execution identity from tokenizer filenames, release names or sam
 Each StateImage contains the Text GDN state and continuation hidden. Per GDN layer, recurrent
 state has one `[Dv,Dk]` matrix per value head, and convolution history has
 `(2 * key_width + value_width) * (kernel_width - 1)` values. Program sizes Device/Host StateImage
-capacity under the [context resource contract](resource-scheduling-and-context-cache.md#11-配置语义与有界性).
+capacity under the [context resource contract](resource-scheduling-and-context-cache.md#capacity).
 ReplaySSM records are separate pending-round scratch when speculation is enabled.
 
 Text GQA KV grows with visible context. Selected MTP owns separate KV; DFlash backends own the

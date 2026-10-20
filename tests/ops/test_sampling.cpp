@@ -6,6 +6,8 @@
 // input.  The test never reproduces the device RNG algorithm or uses another
 // production path as a golden.
 #include "ninfer/ops/sampling.h"
+#include "cuda_fixture.h"
+#include "core/buffer.h"
 #include "ops/op_tester.h"
 
 #include <algorithm>
@@ -43,7 +45,8 @@ bool same_config(const ops::SamplingConfig& a, const ops::SamplingConfig& b) {
     return a.temperature == b.temperature && a.top_k == b.top_k && a.top_p == b.top_p &&
            a.min_p == b.min_p && a.presence_penalty == b.presence_penalty &&
            a.frequency_penalty == b.frequency_penalty && a.seed == b.seed &&
-           a.token_counts == b.token_counts;
+           a.token_counts == b.token_counts && a.mask.words == b.mask.words &&
+           a.mask.stride == b.mask.stride;
 }
 
 std::vector<std::uint16_t> bf16_bits(const std::vector<float>& values) {
@@ -83,14 +86,17 @@ std::vector<int> greedy_oracle(const std::vector<float>& logits, int physical_ro
 
 Distribution distribution_oracle(const std::vector<float>& column, int token_domain,
                                  const ops::SamplingConfig& config,
-                                 const std::vector<int>* counts = nullptr) {
-    std::vector<Candidate> candidates(static_cast<std::size_t>(token_domain));
+                                 const std::vector<int>* counts         = nullptr,
+                                 const std::vector<std::uint32_t>* mask = nullptr) {
+    std::vector<Candidate> candidates;
+    candidates.reserve(token_domain);
     for (int token = 0; token < token_domain; ++token) {
+        if (mask && !((*mask)[token / 32] & (1u << (token % 32)))) { continue; }
         const int count = counts == nullptr ? 0 : (*counts)[static_cast<std::size_t>(token)];
         double adjusted = static_cast<double>(column[static_cast<std::size_t>(token)]);
         if (count > 0) { adjusted -= static_cast<double>(config.presence_penalty); }
         adjusted -= static_cast<double>(config.frequency_penalty) * static_cast<double>(count);
-        candidates[static_cast<std::size_t>(token)] = {adjusted, token};
+        candidates.push_back({adjusted, token});
     }
     std::sort(candidates.begin(), candidates.end(), [](const Candidate& a, const Candidate& b) {
         if (a.adjusted != b.adjusted) { return a.adjusted > b.adjusted; }
@@ -99,7 +105,7 @@ Distribution distribution_oracle(const std::vector<float>& column, int token_dom
 
     int cap = 20;
     if (config.top_k > 0 && config.top_k < 20) { cap = config.top_k; }
-    cap = std::min(cap, token_domain);
+    cap = std::min(cap, static_cast<int>(candidates.size()));
     candidates.resize(static_cast<std::size_t>(cap));
 
     std::vector<double> weights(static_cast<std::size_t>(cap));
@@ -175,15 +181,17 @@ RunResult run_batch(const std::vector<float>& logits, int physical_rows, int tok
     DeviceBuffer device_configs                             = to_device(configs);
     DeviceBuffer device_positions                           = to_device(logical_positions);
 
-    Tensor logits_tensor(device_logits.p, DType::BF16, {physical_rows, batch});
-    Tensor out_tensor(device_out.data(), DType::I32, {batch});
-    Tensor positions_tensor(device_positions.p, DType::I32, {batch});
+    Tensor logits_tensor(device_logits.span(), DType::BF16, {physical_rows, batch});
+    Tensor out_tensor(device_out.span(), DType::I32, {batch});
+    Tensor positions_tensor(device_positions.span(), DType::I32, {batch});
     const std::size_t workspace_bytes =
         ops::sampling_workspace_capacity_bytes(token_domain, batch, batch);
-    WorkspaceArena workspace(std::max<std::size_t>(256, workspace_bytes));
+    ninfer::DeviceBuffer workspace_storage(ninfer::test::cuda_environment().context.device(),
+                                           std::max<std::size_t>(256, workspace_bytes));
+    MemoryArena workspace(workspace_storage.span());
     ops::sample(logits_tensor, out_tensor, token_domain,
-                static_cast<const ops::SamplingConfig*>(device_configs.p), positions_tensor,
-                purpose, workspace, nullptr);
+                static_cast<const ops::SamplingConfig*>(device_configs.data()), positions_tensor,
+                purpose, workspace, ninfer::test::cuda_environment().default_execution);
     cuda_synchronize();
 
     RunResult result;
@@ -252,19 +260,21 @@ RunResult run_repeated(const std::vector<float>& column, int token_domain, int t
     for (int i = 0; i < total; ++i) { positions[static_cast<std::size_t>(i)] = position + i; }
     DeviceBuffer device_positions = to_device(positions);
 
-    Tensor logits_tensor(device_logits.p, DType::BF16, {physical_rows, batch});
+    Tensor logits_tensor(device_logits.span(), DType::BF16, {physical_rows, batch});
     const std::size_t workspace_bytes =
         ops::sampling_workspace_capacity_bytes(token_domain, batch, batch);
-    WorkspaceArena workspace(std::max<std::size_t>(256, workspace_bytes));
+    ninfer::DeviceBuffer workspace_storage(ninfer::test::cuda_environment().context.device(),
+                                           std::max<std::size_t>(256, workspace_bytes));
+    MemoryArena workspace(workspace_storage.span());
 
     for (int produced = 0; produced < total; produced += batch) {
-        auto* out = static_cast<std::int32_t*>(collected.data()) + produced;
-        auto* pos = static_cast<std::int32_t*>(device_positions.p) + produced;
-        Tensor out_tensor(out, DType::I32, {batch});
-        Tensor positions_tensor(pos, DType::I32, {batch});
+        Tensor out_tensor(collected.span().subspan(std::size_t(produced) * 4), DType::I32, {batch});
+        Tensor positions_tensor(device_positions.span().subspan(std::size_t(produced) * 4),
+                                DType::I32, {batch});
         ops::sample(logits_tensor, out_tensor, token_domain,
-                    static_cast<const ops::SamplingConfig*>(device_configs.p), positions_tensor,
-                    purpose, workspace, nullptr);
+                    static_cast<const ops::SamplingConfig*>(device_configs.data()),
+                    positions_tensor, purpose, workspace,
+                    ninfer::test::cuda_environment().default_execution);
     }
     cuda_synchronize();
 
@@ -591,6 +601,34 @@ int workspace_route_boundary_contract() {
     return failures;
 }
 
+int grammar_mask_contract() {
+    int failures = 0;
+    for (int domain : {64, 257, 248077}) {
+        // Legal candidates rank below the unmasked top-20. Only two legal tokens remain.
+        std::vector<float> column(domain + 3, 10.0f);
+        column[domain - 1] = 1.0f;
+        column[domain - 2] = 0.0f;
+        std::vector<std::uint32_t> mask((domain + 31) / 32, 0);
+        for (int token : {domain - 1, domain - 2}) mask[token / 32] |= 1u << (token % 32);
+        auto device_mask = to_device(mask);
+        ops::SamplingConfig config;
+        config.mask       = {static_cast<const std::uint32_t*>(device_mask.data()),
+                             static_cast<int>(mask.size())};
+        const auto greedy = run_homogeneous_batch(repeat_column(column, 8), domain + 3, domain, 8,
+                                                  config, 0, ops::kSamplePurposeDecode);
+        failures += greedy.integrity_failures;
+        failures += verify_exact("masked greedy", greedy.tokens, std::vector<int>(8, domain - 1));
+        config.temperature = 0.75f;
+        config.seed        = 713179;
+        const auto oracle  = distribution_oracle(column, domain, config, nullptr, &mask);
+        const auto sampled =
+            run_repeated(column, domain, 4096, 8, config, 100, ops::kSamplePurposeDecode);
+        failures += sampled.integrity_failures;
+        failures += verify_distribution("masked distribution", sampled.tokens, oracle);
+    }
+    return failures;
+}
+
 int increment_counts_contract() {
     const std::vector<std::int32_t> ids{1, 3, 1, 7};
     const std::vector<std::int32_t> initial{0, 2, 0, 4, 0, 0, 0, 1};
@@ -598,9 +636,10 @@ int increment_counts_contract() {
     DeviceBuffer device_ids = to_device(ids);
     GuardedDeviceBuffer device_counts(initial.size() * sizeof(std::int32_t));
     device_counts.copy_from_host(initial.data(), initial.size() * sizeof(std::int32_t));
-    Tensor token_ids(device_ids.p, DType::I32, {static_cast<std::int32_t>(ids.size())});
-    Tensor counts(device_counts.data(), DType::I32, {static_cast<std::int32_t>(initial.size())});
-    ops::increment_token_counts(token_ids, counts, nullptr);
+    Tensor token_ids(device_ids.span(), DType::I32, {static_cast<std::int32_t>(ids.size())});
+    Tensor counts(device_counts.span(), DType::I32, {static_cast<std::int32_t>(initial.size())});
+    ops::increment_token_counts(token_ids, counts,
+                                ninfer::test::cuda_environment().default_execution);
     cuda_synchronize();
 
     int failures =
@@ -642,6 +681,7 @@ int main() {
     failures += rng_key_contract();
     failures += workspace_route_boundary_contract();
     failures += increment_counts_contract();
+    failures += grammar_mask_contract();
 
     std::cout << (failures == 0 ? "OK" : "FAIL") << " sample public contract\n";
     return failures == 0 ? 0 : 1;

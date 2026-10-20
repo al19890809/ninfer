@@ -1,5 +1,6 @@
 #include "ninfer/engine.h"
 #include "speculative_page_boundary.h"
+#include "kv_cache_storage.h"
 
 #include <algorithm>
 #include <cstdlib>
@@ -17,6 +18,7 @@ ninfer::RequestOptions request(std::uint32_t outputs, bool reuse = false) {
     ninfer::RequestOptions options;
     options.execution.requested_output_tokens = outputs;
     options.execution.sampling.temperature    = 0.0F;
+    options.execution.sampling.seed           = 0;
     options.execution.allow_prefix_reuse      = reuse;
     options.stop.include_model_defaults       = false;
     return options;
@@ -78,13 +80,11 @@ int main(int argc, char** argv) {
         options.kv_capacity     = ninfer::KvCapacityPolicy::explicit_capacity(2304 * batch);
         options.prefill_chunk   = 2304;
         options.max_concurrency = batch;
-        options.context_cache.device_state_slots     = argc > 7 ? std::stoul(argv[7]) : 3U;
-        options.use_cuda_graph                       = graph;
-        options.enable_vision                        = argc > 6 && std::stoi(argv[6]) != 0;
-        options.kv_cache                             = argc > 5 && std::string(argv[5]) == "int8"
-                                                           ? ninfer::KvCacheStorage::Int8Group64
-                                                           : ninfer::KvCacheStorage::BFloat16;
-        auto penalty                                 = request(24);
+        options.context_cache.device_state_slots = argc > 7 ? std::stoul(argv[7]) : 3U;
+        options.use_cuda_graph                   = graph;
+        options.enable_vision                    = argc > 6 && std::stoi(argv[6]) != 0;
+        options.kv_cache = ninfer::test::parse_kv_cache_storage(argc > 5 ? argv[5] : "bf16");
+        auto penalty     = request(24);
         penalty.execution.sampling.presence_penalty  = 0.5F;
         penalty.execution.sampling.frequency_penalty = 0.25F;
         options.speculative.backend                  = ninfer::SpeculativeBackend::DFlash2;
@@ -92,6 +92,8 @@ int main(int argc, char** argv) {
         options.speculative.proposal_head =
             optimized ? ninfer::ProposalHead::Optimized : ninfer::ProposalHead::Full;
         ninfer::Engine engine(options);
+        require(engine.memory_summary().kv_cache == options.kv_cache,
+                "Engine did not select the requested KV dtype");
         const auto prompt = engine.tokenize_text("Count from one to twenty: one, two, three,");
         ninfer::test::speculative_page_boundary(engine);
         const auto first = engine.generate(engine.prepare_tokens(prompt), request(24));
@@ -101,6 +103,19 @@ int main(int argc, char** argv) {
         const auto penalized = engine.generate(engine.prepare_tokens(prompt), penalty);
         valid(penalized, 24);
 
+        ninfer::PromptInput thinking_prompt;
+        thinking_prompt.options.enable_thinking = true;
+        thinking_prompt.messages.push_back({
+            .role  = ninfer::ChatRole::User,
+            .parts = {{.kind = ninfer::MessagePartKind::Text,
+                       .text = "Explain why there are infinitely many prime numbers."}},
+        });
+        auto thinking_request                      = request(64);
+        thinking_request.execution.thinking.budget = 1;
+        const auto forced = engine.generate(engine.prepare(thinking_prompt), thinking_request);
+        valid(forced, 64);
+        require(forced.thinking.applied && forced.thinking.injected_tokens != 0,
+                "DFlash2 did not commit the forced thinking-control suffix");
 
         // All rows share a known target prefix, while their budgets force P=0, partial and full W.
         std::vector<ninfer::GenerationHandle> handles;
@@ -145,7 +160,7 @@ int main(int argc, char** argv) {
                     reference.begin() + i) {
                     continue;
                 }
-                auto stopped_options = request(24, true);
+                auto stopped_options = request(24, false);
                 stopped_options.stop.token_ids.push_back(reference[i]);
                 const auto stopped =
                     engine.generate(engine.prepare_tokens(prompt), stopped_options);
@@ -153,23 +168,17 @@ int main(int argc, char** argv) {
                                       stopped.speculative.accepted_tokens +
                                       stopped.speculative.fallback_steps;
                 if (stopped.generated_token_ids.size() >= licensed) { continue; }
-                require(stopped.finish_reason == ninfer::FinishReason::StopToken,
+                require(stopped.finish_reason == ninfer::FinishReason::StopToken &&
+                            !stopped.generated_token_ids.empty() &&
+                            stopped.generated_token_ids.back() == reference[i],
                         "partial terminal did not stop at its token");
                 auto follow = prompt;
                 follow.insert(follow.end(), stopped.generated_token_ids.begin(),
                               stopped.generated_token_ids.end());
                 follow.push_back(198);
-                const auto reused_stop =
-                    engine.generate(engine.prepare_tokens(follow), request(8, true));
-                const auto fresh_stop =
+                const auto after_stop =
                     engine.generate(engine.prepare_tokens(follow), request(8, false));
-                valid(reused_stop, 8);
-                valid(fresh_stop, 8);
-                require(reused_stop.reused_prompt_tokens != 0 &&
-                            reused_stop.reused_prompt_tokens <=
-                                prompt.size() + stopped.generated_token_ids.size() &&
-                            fresh_stop.reused_prompt_tokens == 0,
-                        "partial terminal exposed an uncommitted prefix");
+                valid(after_stop, 8);
                 checked_partial = true;
                 break;
             }
@@ -190,8 +199,7 @@ int main(int argc, char** argv) {
             }
         }
         const auto stats = engine.runtime_stats();
-        require(stats.device_backend_kv_occupied_pages == 0 && stats.backend_kv_d2h_bytes == 0 &&
-                    stats.backend_kv_h2d_bytes == 0,
+        require(stats.kv_pools.size() == 1 && stats.context_transfers.kv.size() == 1,
                 "DFlash2 allocated or transferred a full backend KV pool");
         if (k == 15) {
             // One oversized prefill replaces the ring, then decode appends across its wrap point.
@@ -222,8 +230,8 @@ int main(int argc, char** argv) {
         std::cout << "ok K=" << k << " B=" << batch << " graph=" << graph
                   << " optimized=" << optimized << " accepted=" << first.speculative.accepted_tokens
                   << "/" << first.speculative.drafted_tokens
-                  << " state_d2h=" << stats.state_d2h_count
-                  << " state_h2d=" << stats.state_h2d_count << '\n';
+                  << " state_d2h=" << stats.context_transfers.state[0].images
+                  << " state_h2d=" << stats.context_transfers.state[1].images << '\n';
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';
         return 1;

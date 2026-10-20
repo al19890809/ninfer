@@ -90,16 +90,8 @@ const char* prefix_reuse_path_name(ninfer::PrefixReusePath path) noexcept {
     switch (path) {
     case ninfer::PrefixReusePath::Root:
         return "root";
-    case ninfer::PrefixReusePath::PrivateEndpoint:
-        return "private endpoint";
-    case ninfer::PrefixReusePath::PrivateTurnClosure:
-        return "turn closure";
-    case ninfer::PrefixReusePath::PrivateResponseReplay:
-        return "response replay";
-    case ninfer::PrefixReusePath::PrivateLongAnchor:
-        return "long anchor";
-    case ninfer::PrefixReusePath::SharedStablePrefix:
-        return "shared prefix";
+    case ninfer::PrefixReusePath::Checkpoint:
+        return "checkpoint";
     }
     return "unknown";
 }
@@ -231,8 +223,7 @@ OperationalRecord render_request_rejected(const RequestRejectionLogContext& cont
 OperationalRecord render_request_done(const RequestLogContext& context,
                                       const GenerationOutcome& outcome) {
     const GenerationMetrics& metrics     = outcome.metrics;
-    const double computed_prefill_tokens = static_cast<double>(
-        std::max(0, outcome.prompt_tokens - static_cast<int>(metrics.prefix_cache_hit_tokens)));
+    const double computed_prefill_tokens = static_cast<double>(metrics.computed_prefill_tokens);
     const double decode_tokens =
         outcome.completion_tokens > 0 ? static_cast<double>(outcome.completion_tokens - 1) : 0.0;
     std::ostringstream out;
@@ -359,6 +350,12 @@ OperationalRecord render_throughput(const ThroughputReport& report) {
     if (report.current.waiting_requests != 0) {
         out << " | waiting " << report.current.waiting_requests;
     }
+    if (report.current.paused_requests != 0) {
+        out << " | paused " << report.current.paused_requests;
+    }
+    if (report.current.replaying_requests != 0) {
+        out << " | replaying " << report.current.replaying_requests;
+    }
     if (report.current.materializing_requests != 0) {
         out << " | materializing " << report.current.materializing_requests;
     }
@@ -452,17 +449,9 @@ void OperationalLog::engine_capacity(const GenerationService& service) const {
                   product::format_pretty_bytes(memory.runtime_reservation_bytes),
                   product::format_pretty_bytes(memory.available_after_startup_bytes));
 
-    if (cache.enabled) {
-        logger_->info(
-            "context cache | {} active + {} cached device states | host {} states, {} KV | "
-            "private {} | shared {} | anchors {}",
-            engine.max_concurrency, *cache.device_state_slots, cache.host_state_slots,
-            product::format_pretty_bytes(cache.host_kv_capacity_bytes),
-            *cache.max_private_continuations, *cache.max_shared_prefixes,
-            *cache.max_long_anchors_per_continuation);
-    } else {
-        logger_->info("context cache | root only");
-    }
+    logger_->info("context | history {} | {} active + {} extra device states | host {}",
+                  cache.enabled ? "on" : "off", engine.max_concurrency, *cache.device_state_slots,
+                  product::format_pretty_bytes(*cache.host_capacity_bytes));
 
     if (service.options().enable_vision) {
         const ninfer::MediaCacheSummary media = service.media_cache_summary();
@@ -471,13 +460,19 @@ void OperationalLog::engine_capacity(const GenerationService& service) const {
                       product::format_pretty_bytes(media.live_capacity_bytes));
     }
 
-    logger_->debug("memory ledger | after weights {} | after startup {} | headroom {} | slack {} | "
-                   "CUDA graphs {}",
-                   product::format_pretty_bytes(memory.available_after_weights_bytes),
-                   product::format_pretty_bytes(memory.available_after_startup_bytes),
-                   product::format_pretty_bytes(memory.kv_capacity_headroom_bytes),
-                   product::format_pretty_bytes(memory.planned_slack_bytes),
-                   product::format_pretty_bytes(memory.cuda_graph_allowance_bytes));
+    const auto graph = memory.cuda_graph.value_or(ninfer::GraphMemorySummary{});
+    logger_->debug(
+        "memory ledger | after weights {} | after startup {} | headroom {} | slack {} | "
+        "graph rebuild estimate {} | graph preparation increment {} B | "
+        "graph calibration increment {} B | graph calibration retained {} B | startup retained {} "
+        "B",
+        product::format_pretty_bytes(memory.available_after_weights_bytes),
+        product::format_pretty_bytes(memory.available_after_startup_bytes),
+        product::format_pretty_bytes(memory.kv_capacity_headroom_bytes),
+        product::format_pretty_bytes(memory.planned_slack_bytes),
+        product::format_pretty_bytes(graph.rebuild_estimate_bytes),
+        graph.preparation_increment_bytes, graph.calibration_increment_bytes,
+        graph.calibration_retained_bytes, memory.startup_retained_bytes);
     logger_->debug("context cost | transfer {} | prefill {} | hardware {} | prefill signature {}",
                    ninfer::context_cost_preset_source_name(context_cost.transfer_source),
                    ninfer::context_cost_preset_source_name(context_cost.prefill_source),

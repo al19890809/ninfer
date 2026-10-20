@@ -82,7 +82,8 @@ ReasoningEffort parse_reasoning_effort(std::string_view text) {
 std::string usage_text(const char* argv0) {
     return std::string("usage: ") + argv0 +
            " <model.ninfer> (--prompt <text>|--messages <messages.json>)\n"
-           "       [--max-context N] [--kv-capacity N|auto] [--prefill-chunk N] [--max-new N]\n"
+           "       [--max-context N] [--kv-capacity N|auto] [--prefill-chunk N] [--max-new "
+           "N]\n"
            "       [--device N]\n"
            "       [--kv-dtype bf16|int8|fp8|nvfp4|k8v4] [--spec mtp|dflash|dflash2 --draft-tokens "
            "N]\n"
@@ -91,6 +92,8 @@ std::string usage_text(const char* argv0) {
            "       [--presence-penalty F] [--frequency-penalty F] [--seed N] [--greedy]\n"
            "       [--stop-token-id N]... [--stop <text>]... [--reasoning-stop <text>]...\n"
            "       [--chat-template FILE]\n"
+           "       [--grammar-file FILE | --json-object | --json-schema-file FILE |\n"
+           "        --regex PATTERN | --choice TEXT ...]\n"
            "       [--raw-output] [--print-token-ids] [--no-thinking] [--thinking-budget N]\n"
            "       [--reasoning-effort none|minimal|low|medium|high|xhigh|max] [--vision]\n"
            "       [--no-cuda-graph]\n"
@@ -100,11 +103,13 @@ std::string usage_text(const char* argv0) {
            "Structured message content accepts text, image/image_url, and video/video_url parts;\n"
            "media sources may be local paths, HTTP(S) URLs, or base64 data URIs.\n"
            "--vision enables image/video input and loads the fixed Vision GPU allocations.\n"
+           "--prefill-chunk requires a positive multiple of 128; defaults to 1024, or 4096 with "
+           "CPU expert offload.\n"
            "--thinking-budget caps model-origin thinking tokens; inserted control tokens count "
            "toward --max-new.\n"
-           "--kv-capacity auto leaves " +
+           "Startup uses " +
            std::to_string(kDefaultKvCapacityHeadroomBytes / (1024ULL * 1024ULL)) +
-           " MiB of sizing headroom.\n"
+           " MiB of planning headroom for both explicit and automatic KV capacity.\n"
            "Sampling defaults come from the loaded model and thinking mode; flags override "
            "individual fields.\n";
 }
@@ -130,6 +135,16 @@ Options parse_options(int argc, char** argv) {
             options.prompt = value(arg);
         } else if (arg == "--chat-template") {
             options.chat_template_path = value(arg);
+        } else if (arg == "--grammar-file") {
+            options.grammar_path = value(arg);
+        } else if (arg == "--json-object") {
+            options.json_object = true;
+        } else if (arg == "--json-schema-file") {
+            options.json_schema_path = value(arg);
+        } else if (arg == "--regex") {
+            options.regex = value(arg);
+        } else if (arg == "--choice") {
+            options.choices.emplace_back(value(arg));
         } else if (arg == "--messages") {
             options.messages_path = value(arg);
         } else if (arg == "--max-new") {
@@ -207,6 +222,12 @@ Options parse_options(int argc, char** argv) {
         }
     }
 
+    if (int(!options.grammar_path.empty()) + int(!options.json_schema_path.empty()) +
+            int(options.json_object) + int(options.regex.has_value()) +
+            int(!options.choices.empty()) >
+        1)
+        throw std::invalid_argument("select only one of --grammar-file, --json-object, "
+                                    "--json-schema-file, --regex or --choice");
     if (!kv_capacity_explicit) {
         options.kv_capacity = KvCapacityPolicy::explicit_capacity(options.max_context);
     }

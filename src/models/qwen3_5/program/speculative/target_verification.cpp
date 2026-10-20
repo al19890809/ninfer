@@ -1,13 +1,12 @@
 #include "models/qwen3_5/program/internal.h"
-#include "models/qwen3_5/program/context.h"
-#include "ninfer/ops/scatter.h"
-#include "ninfer/ops/speculative_round.h"
+#include "models/qwen3_5/program/execution_context.h"
+#include "ninfer/ops/indexing.h"
+#include "ninfer/ops/speculative_accept.h"
 
 namespace ninfer::models::qwen3_5::execution {
 
-void target_verify_accept(ExecutionCore& execution, Tensor& continuation_hidden_store,
-                          TextContext& card, TargetVerifyFrameView frame,
-                          ops::CausalAttentionExecutionEnvelope envelope) {
+void target_verify_forward(TextContext& card, TargetVerifyFrameView frame,
+                           ops::CausalAttentionExecutionEnvelope envelope) {
     if (frame.replay_records == nullptr) {
         throw std::logic_error("speculative target verify has no ReplaySSM record storage");
     }
@@ -23,25 +22,30 @@ void target_verify_accept(ExecutionCore& execution, Tensor& continuation_hidden_
                                  envelope, frame.target_hidden, frame.target_logits,
                                  frame.target_tokens);
     }
+}
+
+void target_accept(ExecutionCore& execution, Tensor& continuation_hidden_store,
+                   TargetVerifyFrameView frame) {
     if (frame.proposal_q.data != nullptr) {
         ops::speculative_accept_sparse_drafts(
             frame.target_tokens, frame.target_logits, frame.drafts, frame.candidate_ids,
             frame.proposal_q, frame.current_extents, frame.frontiers, frame.anchors,
             frame.licensed_tokens, frame.licensed_counts, frame.accepted_drafts,
             dimension(execution.parameters.model.resources().public_token_count), frame.sampling,
-            {false}, execution.work, execution.device.stream);
+            {false}, execution.work, execution.cuda);
     } else {
         ops::speculative_accept_greedy_drafts(
             frame.target_tokens, frame.target_logits, frame.drafts, frame.current_extents,
             frame.frontiers, frame.anchors, frame.licensed_tokens, frame.licensed_counts,
             frame.accepted_drafts,
             dimension(execution.parameters.model.resources().public_token_count), frame.sampling,
-            execution.work, execution.device.stream);
+            execution.work, execution.cuda);
     }
-    ops::speculative_select_accepted_hidden(frame.target_hidden, frame.accepted_drafts,
-                                            frame.selected_hidden, execution.device.stream);
+    ops::gather_bf16_batch_columns(frame.target_hidden, frame.accepted_drafts,
+                                   frame.selected_hidden, execution.cuda);
     ops::scatter(frame.selected_hidden, frame.state_destination_slots, continuation_hidden_store,
-                 execution.device.stream);
+                 execution.cuda);
 }
+
 
 } // namespace ninfer::models::qwen3_5::execution

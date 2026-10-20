@@ -1,7 +1,7 @@
 # Build system
 
 NInfer builds from its source tree with CMake 3.28+ and C++/CUDA 20.
-The supported architecture is `sm_120a`; CUDA 13.1 is the validated development toolkit.
+The supported architecture is `sm_120a`; CUDA 13.4 is the validated development toolkit.
 Product commands and prerequisites are in the
 [README](../../README.md#quick-start); test and measurement workflows live in
 [tests](../../tests/README.md) and [benchmarks](../../bench/README.md).
@@ -25,9 +25,14 @@ to model media decoding and remains required when apps are disabled. Curl and sp
 only for product support. A Python 3 interpreter is found when tests are configured. The larger Python
 pytest suites and conversion/evaluation scripts run separately from CMake and CTest.
 
-CUDA 13.1 and Python 3.11 describe the maintained environment, not configuration version gates.
+CUDA 13.4 and Python 3.11 describe the maintained environment, not configuration version gates.
 CMake also discovers FFmpeg without imposing library version floors. Actual language/API support
-is exercised by compilation and tests. The libcurl 7.85 minimum has a concrete API basis:
+is exercised by compilation and tests. CPU facilities target Linux x86-64 and use hwloc >= 2.5
+for topology discovery without changing the caller's binding. The internal `ninfer_cpu` target
+is ordinary C++, links hwloc/Threads, and can run its tests without CUDA initialization or linkage.
+Core direct-file I/O uses liburing >= 2.5, discovered through pkg-config. Its registered files and
+buffers are owned by the read queue's caller; the queue creates no CUDA resources or worker threads.
+The libcurl 7.85 minimum has a concrete API basis:
 media acquisition uses `CURLOPT_PROTOCOLS_STR` and `CURLOPT_REDIR_PROTOCOLS_STR`, introduced in
 [that release](https://curl.se/libcurl/c/CURLOPT_PROTOCOLS_STR.html).
 
@@ -66,25 +71,15 @@ package export or configure-time dependency download.
 
 ## Targets and dependencies
 
-`cmake/Dependencies.cmake` discovers system CUDA, Threads, FFmpeg and conditional curl, and
-exposes the repository-pinned JSON/HTTP headers and conditional spdlog library. External include
-requirements follow their consuming targets. `cmake/NinferTargets.cmake` provides private
-project includes and the two CUDA archive policies.
+[`cmake/Dependencies.cmake`](../../cmake/Dependencies.cmake) owns system dependency discovery,
+repository-pinned third-party targets and their product-support conditions. External include
+requirements follow their consuming targets.
+[`cmake/NinferTargets.cmake`](../../cmake/NinferTargets.cmake) provides private project includes
+and the two CUDA archive policies.
 
-`src/CMakeLists.txt` explicitly enters the component directories. Each component's
-`CMakeLists.txt` owns its targets, dependency visibility and compile properties:
-
-| Component | Targets |
-|---|---|
-| `core/` | `ninfer_core` |
-| `artifact/` | `ninfer_artifact` |
-| `text/` | `ninfer_text`, including bundled utf8proc C source |
-| `media/` | `ninfer_media_decode` |
-| `ops/` | `ninfer_ops`, `ninfer_nvfp4_non_rdc` |
-| `models/` | `ninfer_model_loading`, `ninfer_model_runtime` |
-| `runtime/` | `ninfer_runtime_support`, `ninfer_engine` and its `ninfer::engine` alias |
-| `product/` | media acquisition, prompt input and logging libraries |
-| `serve/` | `ninfer_serve` |
+[`src/CMakeLists.txt`](../../src/CMakeLists.txt) explicitly enters the component directories.
+Each component's `CMakeLists.txt` owns its targets, dependency visibility and compile properties;
+those files provide the current target and dependency inventory.
 
 Component declaration order is not the execution dependency graph: CMake resolves named target
 links during generation. Model runtime can refer to the runtime support target declared later;
@@ -98,13 +93,15 @@ manifests which use `target_sources(<owner> PRIVATE ...)`. Included manifests an
 with `CMAKE_CURRENT_LIST_DIR`; `include()` does not change `CMAKE_CURRENT_SOURCE_DIR`.
 
 - Every implementation under `src/` has one target owner and one explicit registration.
-- Ops register simple horizontal implementations in `basic_sources.cmake` and larger semantic
-  families in their own manifests. A family also registers its files under `wrapper/`.
-- Linear includes one manifest for each of BF16, FP8, NVFP4, Q4, Q5, Q6 and Q8. Each manifest lists
-  all its shape filenames and their actual `.cpp`/`.cu` extensions.
-- Models separate loading, frontend, execution and Program source lists while retaining the
-  distinct immutable-loading and mutable-runtime targets. Checkpoints/recipes do not define
-  additional compile owners.
+- Ops register implementations through their owning family manifests. Shared weight-input
+  preparation and compile policy are owned by `src/ops/CMakeLists.txt`.
+- Linear separates shared kernel and projection manifests. Format manifests list explicit sources
+  and shape filenames with their actual `.cpp`/`.cu` extensions.
+- Models retain distinct immutable-loading and mutable-runtime targets. Native loading, execution
+  and Program manifests own architecture code; `common/qwen/sources.cmake` owns shared Frontend
+  and Vision sources. Shared bindings and context/MoE mechanisms have explicit target entries.
+  Runtime startup orchestration links model runtime; native startup planners only depend on
+  runtime support/contracts. Checkpoints/recipes do not define additional compile owners.
 - New files require an explicit manifest edit. New families require an explicit parent include.
   There is no recursive glob, directory discovery or generated shape/dispatch registry.
 
@@ -135,8 +132,8 @@ include their domain registrations without creating new CMake subdirectories, pr
 consumers. Tests explicitly name their linked libraries; public-header and pure-host checks keep
 their isolated include/link requirements.
 
-Linear, LinearAdd and LinearSwiGLU reuse compiled test support libraries. Oracle options apply
-to those libraries themselves as well as the test executables. Test variants, skip return codes,
+Tests can reuse compiled support libraries. Oracle options apply to the libraries containing
+oracle code as well as the test executables. Test variants, skip return codes,
 interop commands and special linker options belong with the affected registrations.
 
 For build-organization changes, compare configured target/source ownership, compile flags,
