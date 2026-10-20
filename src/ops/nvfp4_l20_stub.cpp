@@ -15,6 +15,7 @@
 #include "ops/linear/split/nvfp4/shapes/n14336_k5120/launch.h"
 #include "ops/linear/split/nvfp4/shapes/n16384_k5120/launch.h"
 #include "ops/linear_attention/gated_delta_net/input_conv/nvfp4/tma_launch.h"
+#include "ops/softmax_attention/dense/causal_cache/nvfp4/plan.h"
 #include "ops/moe/kernels/cuda/block_scaled/fp8/launch.h"
 #include "ops/moe/kernels/cuda/block_scaled/nvfp4/launch.h"
 
@@ -59,6 +60,12 @@ void launch_a4_tma(const Nvfp4A4Operands&, std::span<const Tensor>, cudaStream_t
     nvfp4_unsupported();
 }
 } // namespace linear_split::nvfp4_n16384_k5120
+
+// ---- dense causal attention: NVFP4 KV plan -------------------------------
+
+std::size_t nvfp4_kv_workspace_bytes(int, int, int, int, CausalAttentionExecutionEnvelope, int) {
+    nvfp4_unsupported();
+}
 
 // ---- MoE block-scaled experts (TMA-based, sm_90+) -------------------------
 
