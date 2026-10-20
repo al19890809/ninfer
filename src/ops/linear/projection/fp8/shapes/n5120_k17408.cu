@@ -68,16 +68,19 @@ void launch_a8(const Tensor& x, const Weight& weight, Tensor& out, Fp8A8Workspac
 #endif
 }
 
-bool uses_a8(std::int32_t, std::int32_t max_tokens) { #ifdef NINFER_L20_NO_PDL
+bool uses_a8(std::int32_t, std::int32_t max_tokens) {
+#ifdef NINFER_L20_NO_PDL
         return false;
 #else
         return max_tokens >= 17;
-#endif }
+#endif
+}
 
 std::size_t partial_capacity_bytes(std::int32_t max_tokens) {
 #ifdef NINFER_L20_NO_PDL
     return 0;
-#else    if (max_tokens > 384) return Bulk::kPartialBytes;
+#else
+    if (max_tokens > 384) return Bulk::kPartialBytes;
     if (max_tokens > 256) return Wide::kPartialBytes;
     if (max_tokens > 128) return Mid::kPartialBytes;
     return max_tokens > 64 ? Small::kPartialBytes : 0;

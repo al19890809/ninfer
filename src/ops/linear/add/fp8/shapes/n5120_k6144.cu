@@ -52,7 +52,8 @@ Fp8LinearAddPlan select_fp8_add_n5120_k6144(LinearPolicy policy, std::int32_t to
     // activation-16 path (correct, slightly slower). FP8 weights are not used
     // by the deployed Q8 model anyway.
     return {select_a16(tokens)};
-#else    if (!allows_a8(policy) || tokens < 17) return {select_a16(tokens)};
+#else
+    if (!allows_a8(policy) || tokens < 17) return {select_a16(tokens)};
     const std::size_t partial_bytes = tokens > 768   ? Bulk::kPartialBytes
                                       : tokens > 192 ? MidBulk::kPartialBytes
                                                      : 0;

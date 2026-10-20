@@ -19,7 +19,8 @@ using Bulk      = Fp8A8TmaSplitKSchedule<Fp8A8TmaMmaSchedule<128, 256, 128, 2, 4
 std::size_t fp8_linear_swiglu_partial_capacity_bytes(std::int32_t max_tokens) {
 #ifdef NINFER_L20_NO_PDL
     return 0;
-#else    return max_tokens > 256 ? Bulk::kPartialBytes : 0;
+#else
+    return max_tokens > 256 ? Bulk::kPartialBytes : 0;
 #endif
 }
 
