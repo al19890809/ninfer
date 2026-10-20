@@ -68,8 +68,14 @@ void launch_matrix(const Tensor& x, const Weight& weight, std::span<const Tensor
                                                            stream);
     };
     const auto tma = [&]<class S>() {
+#ifdef NINFER_L20_NO_PDL
+        // NINFER_L20 / sm_89: TMA unavailable; the plain mma lambda covers the
+        // same operand contract with sm_89-supported schedules.
+        mma.template operator()<S>();
+#else
         launch_bf16_a16_tma_mma<Bf16ScheduleInstance<S, 5120>>(p, output, LinearIdentityEpilogue{},
                                                                stream);
+#endif
     };
     if (p.tokens <= 16)
         launch_bf16_a16_sliced_k_mma<Bf16ScheduleInstance<Bf16A16SlicedR32T16W4, 5120>>(

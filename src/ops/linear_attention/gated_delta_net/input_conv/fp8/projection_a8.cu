@@ -5,10 +5,12 @@
 
 namespace ninfer::ops::detail {
 namespace {
+#ifndef NINFER_L20_NO_PDL
 using Tma64x128  = Fp8A8TmaMmaSchedule<64, 128, 128, 2, 4, 2, 1>;
 using Tma192x128 = Fp8A8TmaMmaSchedule<192, 128, 128, 3, 4, 2, 1>;
 using MidBulk = Fp8A8TmaSplitKSchedule<Fp8A8TmaMmaSchedule<128, 128, 128, 2, 4, 2, 1>, 170, 4, 8>;
 using Bulk    = Fp8A8TmaSplitKSchedule<Fp8A8TmaMmaSchedule<128, 256, 128, 2, 4, 2, 1>, 170, 4, 8>;
+#endif
 
 using Output = LinearBf16SegmentedOutput<10240, 6144>;
 
@@ -30,6 +32,12 @@ struct Plan {
 };
 
 Plan select_projection(int columns) {
+#ifdef NINFER_L20_NO_PDL
+    // NINFER_L20 / sm_89: TMA and split-K bulk routes are sm_90+; the plain
+    // fp8 a8 mma schedules cover the same range (correct, modestly slower).
+    if (columns <= 32) return {launch_projection<Fp8A8T32R32K128>, 0};
+    return {launch_projection<Fp8A8T64R128K256>, 0};
+#else
     if (columns <= 32) return {launch_projection<Fp8A8T32R32K128>, 0};
     if (columns <= 64) return {launch_projection<Fp8A8T64R128K256>, 0};
     if (columns <= 128) return {launch_projection<Tma64x128>, 0};
@@ -37,6 +45,7 @@ Plan select_projection(int columns) {
     const auto partial_bytes = columns > 256 ? Bulk::kPartialBytes : 0;
     if (columns > 384 && columns <= 512) return {launch_projection<MidBulk>, partial_bytes};
     return {launch_projection<Bulk>, partial_bytes};
+#endif
 }
 } // namespace
 

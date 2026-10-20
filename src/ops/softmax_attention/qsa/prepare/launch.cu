@@ -130,12 +130,14 @@ void launch_prepare(const QsaProjectionView& projected, const QsaPrepareParamete
     case KvCacheStorage::Fp8E4M3Row256:
         dispatch<KvCacheStorage::Fp8E4M3Row256>(args, plan, execution.stream());
         break;
+#ifndef NINFER_L20_NO_PDL
     case KvCacheStorage::Nvfp4Group16:
         dispatch<KvCacheStorage::Nvfp4Group16>(args, plan, execution.stream());
         break;
     case KvCacheStorage::Fp8KeyNvfp4Value:
         dispatch<KvCacheStorage::Fp8KeyNvfp4Value>(args, plan, execution.stream());
         break;
+#endif
     default:
         throw std::invalid_argument("qsa_prepare: unsupported KV storage");
     }
