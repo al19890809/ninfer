@@ -152,8 +152,15 @@ void CudaHostCopyBatch::submit(CudaExecutionView execution) const {
     cudaMemcpyAttributes attributes{};
     attributes.srcAccessOrder = cudaMemcpySrcAccessOrderStream;
     std::size_t first         = 0;
+#if CUDART_VERSION >= 13000
     check_copy(cudaMemcpyBatchAsync(destinations_.data(), sources_.data(), sizes_.data(), count_,
                                     &attributes, &first, 1, execution.stream()));
+#else
+    // NINFER_L20 / CUDA 12.8: the (attrs*, attrsIdxs*, numAttrs, stream) overload
+    // only exists in CUDA 13+; 12.8 takes attrs by value without numAttrs.
+    check_copy(cudaMemcpyBatchAsync(destinations_.data(), sources_.data(), sizes_.data(), count_,
+                                    attributes, &first, execution.stream()));
+#endif
 }
 
 } // namespace ninfer
