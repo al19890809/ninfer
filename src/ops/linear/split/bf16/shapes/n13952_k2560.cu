@@ -20,11 +20,21 @@ using S3 = Bf16ScheduleInstance<
     2560>;
 using S4 = Bf16A16MmaSchedule<64, 16, 128, 16, 8, 2, 2, Cache::cg, Cache::cg,
                               Bf16MmaFragmentPipeline::PingPong, Bf16MmaRaster::TokenFast>;
+#ifndef NINFER_L20_NO_PDL
 using S5 = Bf16A16TmaMmaSchedule<128, 64, 128, 32, 32, 2, 1>;
+#endif
+#ifndef NINFER_L20_NO_PDL
 using S6 = Bf16ScheduleInstance<Bf16A16TmaMmaSchedule<128, 32, 128, 16, 16, 2, 1>, 2560>;
+#endif
+#ifndef NINFER_L20_NO_PDL
 using S7 = Bf16ScheduleInstance<Bf16A16TmaMmaSchedule<128, 48, 64, 32, 16, 2, 1>, 2560>;
+#endif
+#ifndef NINFER_L20_NO_PDL
 using S8 = Bf16A16TmaMmaSchedule<64, 64, 64, 32, 32, 3, 2>;
+#endif
+#ifndef NINFER_L20_NO_PDL
 using S9 = Bf16ScheduleInstance<Bf16A16TmaMmaSchedule<64, 128, 64, 32, 32, 3, 1>, 2560>;
+#endif
 
 template <class Routes>
 auto select_route(int tokens, const Routes& routes) {
@@ -33,11 +43,11 @@ auto select_route(int tokens, const Routes& routes) {
     if (tokens <= 16) return routes.template mma<S2>();
     if (tokens <= 32) return routes.template mma<S3>();
     if (tokens <= 48) return routes.template mma<S4>();
-    if (tokens <= 64) return routes.template tma<S5>();
-    if (tokens <= 96) return routes.template tma<S6>();
-    if (tokens <= 128) return routes.template tma<S7>();
-    if (tokens <= 512) return routes.template tma<S8>();
-    return routes.template tma<S9>();
+    if (tokens <= 64) return routes.template mma<S4>();
+    if (tokens <= 96) return routes.template mma<S4>();
+    if (tokens <= 128) return routes.template mma<S4>();
+    if (tokens <= 512) return routes.template mma<S4>();
+    return routes.template mma<S4>();
 }
 
 void launch_split(const Tensor& x, Weights weights, std::span<const Tensor> out, MemoryArena*,

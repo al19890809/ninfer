@@ -22,7 +22,7 @@ struct Bf16ContiguousRoutes {
 
     template <class S>
     static Bf16Launch tma() {
-        return launch_bf16_tma_mma<S>;
+        return launch_bf16_mma<S>;
     }
 };
 

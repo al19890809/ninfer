@@ -20,9 +20,15 @@ using S4 = Bf16ScheduleInstance<
     Bf16A16MmaSchedule<32, 32, 256, 16, 8, 3, 1, Cache::cg, Cache::cg,
                        Bf16MmaFragmentPipeline::PingPong, Bf16MmaRaster::TokenFast>,
     2560>;
+#ifndef NINFER_L20_NO_PDL
 using S5 = Bf16ScheduleInstance<Bf16A16TmaMmaSchedule<64, 32, 64, 16, 16, 3, 2>, 2560>;
+#endif
+#ifndef NINFER_L20_NO_PDL
 using S6 = Bf16ScheduleInstance<Bf16A16TmaMmaSchedule<128, 48, 64, 32, 16, 2, 1>, 2560>;
+#endif
+#ifndef NINFER_L20_NO_PDL
 using S7 = Bf16ScheduleInstance<Bf16A16TmaMmaSchedule<128, 80, 64, 32, 16, 3, 1>, 2560>;
+#endif
 
 template <class Routes>
 auto select(int tokens, const Routes& routes) {
@@ -31,9 +37,9 @@ auto select(int tokens, const Routes& routes) {
     if (tokens <= 48) return routes.template mma<S2>();
     if (tokens <= 64) return routes.template sliced<S3>();
     if (tokens <= 96) return routes.template mma<S4>();
-    if (tokens <= 128) return routes.template tma<S5>();
-    if (tokens <= 512) return routes.template tma<S6>();
-    return routes.template tma<S7>();
+    if (tokens <= 128) return routes.template mma<S4>();
+    if (tokens <= 512) return routes.template mma<S4>();
+    return routes.template mma<S4>();
 }
 
 } // namespace ninfer::ops::detail::bf16_n1664_k2560

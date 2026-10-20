@@ -19,12 +19,12 @@ Bf16Launch select_bf16_n14336_k5120(std::int32_t tokens) {
     if (tokens <= 16)
         return launch_bf16_sliced_k_mma<Bf16ScheduleInstance<Bf16A16SlicedR32T16W4, 5120>>;
     if (tokens <= 32) return launch_bf16_mma<Bf16ScheduleInstance<Bf16A16MmaR32T32K128S3, 5120>>;
-    if (tokens <= 64) return launch_bf16_tma_mma<Bf16ScheduleInstance<Bf16A16TmaR64T64K64S3, 5120>>;
+    if (tokens <= 64) return launch_bf16_mma<Bf16ScheduleInstance<Bf16A16MmaR32T32K128S3, 5120>>;
     if (tokens <= 96) return launch_bf16_mma<Bf16ScheduleInstance<Bf16A16MmaR64T32K64S3, 5120>>;
     if (tokens <= 128)
-        return launch_bf16_tma_mma<Bf16ScheduleInstance<Bf16A16TmaR64T128K64S2, 5120>>;
+        return launch_bf16_mma<Bf16ScheduleInstance<Bf16A16MmaR64T32K64S3, 5120>>;
     if (tokens <= 192)
-        return launch_bf16_tma_mma<Bf16ScheduleInstance<Bf16A16TmaR64T64K64S3, 5120>>;
-    return launch_bf16_tma_mma<Bf16ScheduleInstance<Bf16A16TmaR64T128K64S2, 5120>>;
+        return launch_bf16_mma<Bf16ScheduleInstance<Bf16A16MmaR64T32K64S3, 5120>>;
+    return launch_bf16_mma<Bf16ScheduleInstance<Bf16A16MmaR64T32K64S3, 5120>>;
 }
 } // namespace ninfer::ops::detail

@@ -5,15 +5,26 @@
 namespace ninfer::ops::detail::linear_split::fp8_n14336_k5120 {
 
 namespace {
+#ifndef NINFER_L20_NO_PDL
 using Tma64x128 = Fp8A8TmaMmaSchedule<64, 128, 128, 2, 4, 2, 1>;
+#endif
+#ifndef NINFER_L20_NO_PDL
 using Tma64x256 = Fp8A8TmaMmaSchedule<64, 256, 128, 2, 4, 2, 1>;
+#endif
+#ifndef NINFER_L20_NO_PDL
 using Tma96x256 = Fp8A8TmaMmaSchedule<96, 256, 128, 3, 4, 2, 1>;
+#endif
+#ifndef NINFER_L20_NO_PDL
 using Bulk      = Fp8A8TmaSplitKSchedule<Fp8A8TmaMmaSchedule<128, 256, 128, 2, 4, 2, 1>, 170, 4, 8>;
+#endif
 
 } // namespace
 
 std::size_t partial_capacity(std::int32_t max_tokens) {
-    return max_tokens > 384 ? Bulk::kPartialBytes : 0;
+#ifdef NINFER_L20_NO_PDL
+    return 0;
+#else    return max_tokens > 384 ? Bulk::kPartialBytes : 0;
+#endif
 }
 
 void launch_a8(const Tensor& x, const Weight& weight, std::span<const Tensor> outputs,
@@ -33,11 +44,11 @@ void launch_a8(const Tensor& x, const Weight& weight, std::span<const Tensor> ou
     };
     if (x.ne[1] <= 32) return launch.template operator()<Fp8A8T32R32K128>();
     if (x.ne[1] <= 96) return launch.template operator()<Fp8A8T32R128K128>();
-    if (x.ne[1] <= 128) return launch.template operator()<Tma64x128>();
-    if (x.ne[1] <= 192) return launch.template operator()<Tma64x256>();
+    if (x.ne[1] <= 128) return launch.template operator()<Fp8A8T32R128K128>();
+    if (x.ne[1] <= 192) return launch.template operator()<Fp8A8T32R128K128>();
     // Three 96-token tiles give 168 CTAs: one almost-full wave through T=288.
-    if (x.ne[1] <= 288) return launch.template operator()<Tma96x256>();
-    launch.template operator()<Bulk>();
+    if (x.ne[1] <= 288) return launch.template operator()<Fp8A8T32R128K128>();
+    launch.template operator()<Fp8A8T32R128K128>();
 }
 
 } // namespace ninfer::ops::detail::linear_split::fp8_n14336_k5120

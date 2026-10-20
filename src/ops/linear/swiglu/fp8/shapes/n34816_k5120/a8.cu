@@ -5,13 +5,22 @@
 
 namespace ninfer::ops::detail {
 namespace {
+#ifndef NINFER_L20_NO_PDL
 using Tma64x128 = Fp8A8TmaMmaSchedule<64, 128, 128, 2, 4, 2, 1>;
+#endif
+#ifndef NINFER_L20_NO_PDL
 using Tma64x256 = Fp8A8TmaMmaSchedule<64, 256, 128, 2, 4, 2, 1>;
+#endif
+#ifndef NINFER_L20_NO_PDL
 using Bulk      = Fp8A8TmaSplitKSchedule<Fp8A8TmaMmaSchedule<128, 256, 128, 2, 4, 2, 1>, 170, 4, 8>;
+#endif
 } // namespace
 
 std::size_t fp8_linear_swiglu_partial_capacity_bytes(std::int32_t max_tokens) {
-    return max_tokens > 256 ? Bulk::kPartialBytes : 0;
+#ifdef NINFER_L20_NO_PDL
+    return 0;
+#else    return max_tokens > 256 ? Bulk::kPartialBytes : 0;
+#endif
 }
 
 void launch_fp8_swiglu_a8(const Tensor& x, const Weight& weight, Tensor& out,
@@ -34,8 +43,8 @@ void launch_fp8_swiglu_a8(const Tensor& x, const Weight& weight, Tensor& out,
     if (x.ne[1] <= 16) return launch.template operator()<Fp8A8T16R64K128>();
     if (x.ne[1] <= 32) return launch.template operator()<Fp8A8T32R128K128>();
     if (x.ne[1] <= 64) return launch.template operator()<Fp8A8T64R128K256>();
-    if (x.ne[1] <= 128) return launch.template operator()<Tma64x128>();
-    if (x.ne[1] <= 192) return launch.template operator()<Tma64x256>();
-    launch.template operator()<Bulk>();
+    if (x.ne[1] <= 128) return launch.template operator()<Fp8A8T64R128K256>();
+    if (x.ne[1] <= 192) return launch.template operator()<Fp8A8T64R128K256>();
+    launch.template operator()<Fp8A8T64R128K256>();
 }
 } // namespace ninfer::ops::detail

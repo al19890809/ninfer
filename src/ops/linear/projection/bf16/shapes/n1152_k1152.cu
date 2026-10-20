@@ -17,10 +17,18 @@ using S5 = Bf16ScheduleInstance<
     Bf16A16MmaSchedule<32, 32, 64, 16, 8, 3, 2, Cache::cg, Cache::cg,
                        Bf16MmaFragmentPipeline::PingPong, Bf16MmaRaster::TokenFast>,
     1152>;
+#ifndef NINFER_L20_NO_PDL
 using S6 = Bf16ScheduleInstance<Bf16A16TmaMmaSchedule<32, 64, 64, 16, 8, 3, 1>, 1152>;
+#endif
+#ifndef NINFER_L20_NO_PDL
 using S7 = Bf16ScheduleInstance<Bf16A16TmaMmaSchedule<64, 64, 64, 32, 16, 3, 2>, 1152>;
+#endif
+#ifndef NINFER_L20_NO_PDL
 using S8 = Bf16ScheduleInstance<Bf16A16TmaMmaSchedule<64, 128, 64, 32, 32, 3, 1>, 1152>;
+#endif
+#ifndef NINFER_L20_NO_PDL
 using S9 = Bf16ScheduleInstance<Bf16A16TmaMmaSchedule<128, 128, 64, 64, 32, 3, 1>, 1152>;
+#endif
 } // namespace
 
 Bf16Launch select_bf16_n1152_k1152(std::int32_t tokens) {
@@ -32,10 +40,10 @@ Bf16Launch select_bf16_n1152_k1152(std::int32_t tokens) {
     if (tokens <= 40) return launch_bf16_sliced_k_mma<S3>;
     if (tokens <= 64) return launch_bf16_sliced_k_mma<S4>;
     if (tokens <= 128) return launch_bf16_mma<S5>;
-    if (tokens <= 256) return launch_bf16_tma_mma<S6>;
-    if (tokens <= 512) return launch_bf16_tma_mma<S7>;
-    if (tokens <= 1024) return launch_bf16_tma_mma<S8>;
-    if (tokens <= 2048) return launch_bf16_tma_mma<S9>;
-    return launch_bf16_tma_mma<S7>;
+    if (tokens <= 256) return launch_bf16_mma<S5>;
+    if (tokens <= 512) return launch_bf16_mma<S5>;
+    if (tokens <= 1024) return launch_bf16_mma<S5>;
+    if (tokens <= 2048) return launch_bf16_mma<S5>;
+    return launch_bf16_mma<S5>;
 }
 } // namespace ninfer::ops::detail

@@ -158,8 +158,10 @@ void CudaHostCopyBatch::submit(CudaExecutionView execution) const {
 #else
     // NINFER_L20 / CUDA 12.8: the (attrs*, attrsIdxs*, numAttrs, stream) overload
     // only exists in CUDA 13+; 12.8 takes attrs by value without numAttrs.
-    check_copy(cudaMemcpyBatchAsync(destinations_.data(), sources_.data(), sizes_.data(), count_,
-                                    attributes, &first, execution.stream()));
+    // sizes_ is const here but the 12.8 API takes a non-const size pointer.
+    check_copy(cudaMemcpyBatchAsync(destinations_.data(), sources_.data(),
+                                    const_cast<std::size_t*>(sizes_.data()), count_, attributes,
+                                    &first, execution.stream()));
 #endif
 }
 

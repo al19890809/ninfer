@@ -17,10 +17,14 @@ using S3 =
     Bf16RowTailSchedule<Bf16ScheduleInstance<Bf16A16SlicedKMmaSchedule<16, 16, 4, 128, 3>, 10240>>;
 using S4 =
     Bf16RowTailSchedule<Bf16ScheduleInstance<Bf16A16SlicedKMmaSchedule<16, 16, 4, 64, 6>, 10240>>;
+#ifndef NINFER_L20_NO_PDL
 using S5 = Bf16RowTailSchedule<
     Bf16ScheduleInstance<Bf16A16TmaMmaSchedule<32, 64, 64, 16, 8, 4, 1>, 10240>>;
+#endif
+#ifndef NINFER_L20_NO_PDL
 using S6 = Bf16RowTailSchedule<
     Bf16ScheduleInstance<Bf16A16TmaMmaSchedule<64, 48, 64, 16, 8, 4, 1>, 10240>>;
+#endif
 } // namespace
 
 Bf16Launch select_bf16_n324_k10240(std::int32_t tokens) {
@@ -29,7 +33,7 @@ Bf16Launch select_bf16_n324_k10240(std::int32_t tokens) {
     if (tokens <= 48) return launch_bf16_sliced_k_mma<S2>;
     if (tokens <= 96) return launch_bf16_sliced_k_mma<S3>;
     if (tokens <= 128) return launch_bf16_sliced_k_mma<S4>;
-    if (tokens <= 512) return launch_bf16_tma_mma<S5>;
-    return launch_bf16_tma_mma<S6>;
+    if (tokens <= 512) return launch_bf16_sliced_k_mma<S4>;
+    return launch_bf16_sliced_k_mma<S4>;
 }
 } // namespace ninfer::ops::detail

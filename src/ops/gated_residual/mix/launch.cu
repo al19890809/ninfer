@@ -39,6 +39,13 @@ void down(Operands o, Down schedule, Scratch scratch, cudaStream_t stream) {
     const LinearIdentityEpilogue identity;
     const Bf16SplitKWorkspace partials{static_cast<float*>(scratch.partials.data),
                                        scratch.partials.bytes};
+#ifdef NINFER_L20_NO_PDL
+    // NINFER_L20 / sm_89: TMA MMA is sm_90+; the split-K mma path is the
+    // nearest supported equivalent (correct, modestly slower for large P).
+    if (schedule == Down::TmaSplit2 || schedule == Down::TmaSplit4 ||
+        schedule == Down::Tma96Split4 || schedule == Down::Tma96Split8 || schedule == Down::Tma80)
+        schedule = Down::Split8x16;
+#endif
     switch (schedule) {
     case Down::Gemv:
         launch_bf16_a16_gemv<DownGemv>(p, output, identity, stream);
@@ -54,6 +61,7 @@ void down(Operands o, Down schedule, Scratch scratch, cudaStream_t stream) {
         launch_bf16_a16_split_k_mma<DownSchedule<Form, SplitSchedule<32, 32, 64, 1>>, 8>(
             p, output, identity, partials, stream);
         break;
+#ifndef NINFER_L20_NO_PDL
     case Down::TmaSplit2:
         launch_bf16_a16_tma_split_k_mma<
             DownSchedule<Form, Bf16A16TmaMmaSchedule<32, 64, 64, 16, 8, 4, 1>>, 2>(
@@ -78,6 +86,7 @@ void down(Operands o, Down schedule, Scratch scratch, cudaStream_t stream) {
         launch_bf16_a16_tma_mma<DownSchedule<Form, Bf16A16TmaMmaSchedule<32, 80, 64, 16, 8, 5, 1>>>(
             p, output, identity, stream);
         break;
+#endif
     }
 }
 
@@ -113,6 +122,11 @@ void launch(Kind kind, Operands o, Plan p, Scratch scratch, CudaExecutionView ex
         down<Kind::Block>(o, p.down, scratch, execution.stream());
     else
         down<Kind::Final>(o, p.down, scratch, execution.stream());
+#ifdef NINFER_L20_NO_PDL
+    // NINFER_L20 / sm_89: no TMA for the up projection either.
+    if (p.up == Up::TmaFolded16x64) p.up = Up::Folded16x16;
+    else if (p.up == Up::TmaFolded32x64) p.up = Up::Folded32x32;
+#endif
     switch (p.up) {
     case Up::Folded16x16:
         folded_up<16, 16>(o, scratch, execution.stream());
@@ -120,12 +134,14 @@ void launch(Kind kind, Operands o, Plan p, Scratch scratch, CudaExecutionView ex
     case Up::Folded32x32:
         folded_up<32, 32>(o, scratch, execution.stream());
         break;
+#ifndef NINFER_L20_NO_PDL
     case Up::TmaFolded16x64:
         tma_folded_up<16>(o, scratch, execution.stream());
         break;
     case Up::TmaFolded32x64:
         tma_folded_up<32>(o, scratch, execution.stream());
         break;
+#endif
     }
 }
 } // namespace ninfer::ops::detail::hc::mix

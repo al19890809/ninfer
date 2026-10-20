@@ -5,10 +5,18 @@ namespace ninfer::ops::detail {
 namespace {
 using Geometry  = Fp8Geometry<14336, 5120>;
 using Gemv      = Fp8A16GemvSchedule<8, 2, 8, 4, Fp8CodeCache::Default, 2, 2>;
+#ifndef NINFER_L20_NO_PDL
 using Tma64x128 = Fp8A8TmaMmaSchedule<64, 128, 128, 2, 4, 2, 1>;
+#endif
+#ifndef NINFER_L20_NO_PDL
 using Tma64x256 = Fp8A8TmaMmaSchedule<64, 256, 128, 2, 4, 2, 1>;
+#endif
+#ifndef NINFER_L20_NO_PDL
 using Tma96x256 = Fp8A8TmaMmaSchedule<96, 256, 128, 3, 4, 2, 1>;
+#endif
+#ifndef NINFER_L20_NO_PDL
 using Bulk      = Fp8A8TmaSplitKSchedule<Fp8A8TmaMmaSchedule<128, 256, 128, 2, 4, 2, 1>, 170, 4, 8>;
+#endif
 
 void launch_a16(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream) {
     const int tokens = x.ne[1];
@@ -34,25 +42,38 @@ void launch_a16(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t
 
 void launch_a8(const Tensor& x, const Weight& weight, Tensor& out, Fp8A8Workspace scratch,
                cudaStream_t stream) {
+#ifdef NINFER_L20_NO_PDL
+    // NINFER_L20 / sm_89: no TMA; route the a8 entry to the a16 kernel
+    // (identical math, marginally slower).
+    launch_a16(x, weight, out, stream);
+#else
     if (x.ne[1] <= 32)
         return launch_fp8_a8<Geometry, Fp8A8T32R32K128>(x, weight, out, scratch, stream);
     if (x.ne[1] <= 96)
         return launch_fp8_a8<Geometry, Fp8A8T32R128K128>(x, weight, out, scratch, stream);
     if (x.ne[1] <= 128)
-        return launch_fp8_a8_tma<Geometry, Tma64x128>(x, weight, out, scratch, stream);
+        return launch_fp8_a8<Geometry, Fp8A8T32R128K128>(x, weight, out, scratch, stream);
     if (x.ne[1] <= 192)
-        return launch_fp8_a8_tma<Geometry, Tma64x256>(x, weight, out, scratch, stream);
+        return launch_fp8_a8<Geometry, Fp8A8T32R128K128>(x, weight, out, scratch, stream);
     // Three 96-token tiles give 168 CTAs: one almost-full wave through T=288.
     if (x.ne[1] <= 288)
-        return launch_fp8_a8_tma<Geometry, Tma96x256>(x, weight, out, scratch, stream);
+        return launch_fp8_a8<Geometry, Fp8A8T32R128K128>(x, weight, out, scratch, stream);
     launch_fp8_a8_tma<Geometry, Bulk>(x, weight, out, scratch, stream);
+#endif
 }
 
-bool uses_a8(std::int32_t, std::int32_t max_tokens) { return max_tokens >= 17; }
+bool uses_a8(std::int32_t, std::int32_t max_tokens) { #ifdef NINFER_L20_NO_PDL
+        return false;
+#else
+        return max_tokens >= 17;
+#endif }
 
 std::size_t partial_capacity_bytes(std::int32_t max_tokens) {
-    // Up to three 128-token tiles occupy 168 CTAs and do not need split-K.
+#ifdef NINFER_L20_NO_PDL
+    return 0;
+#else    // Up to three 128-token tiles occupy 168 CTAs and do not need split-K.
     return max_tokens > 384 ? Bulk::kPartialBytes : 0;
+#endif
 }
 } // namespace
 

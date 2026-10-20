@@ -18,15 +18,30 @@ LinearAddLaunch select_a16(int tokens) {
     return launch_fp8_add_mma<Instance<Fp8A16MmaSchedule<64, 128, 64, 64, 16, 2, 2>>>;
 }
 
+#ifndef NINFER_L20_NO_PDL
 using SmallTile = Fp8A8TmaMmaSchedule<32, 64, 128, 1, 2, 3, 2>;
+#endif
+#ifndef NINFER_L20_NO_PDL
 using Small     = Fp8A8TmaSplitKSchedule<Fp8A8TmaMmaSchedule<64, 128, 128, 2, 4, 3, 1>, 170, 4, 8>;
+#endif
+#ifndef NINFER_L20_NO_PDL
 using Mid       = Fp8A8TmaSplitKSchedule<Fp8A8TmaMmaSchedule<128, 128, 128, 2, 4, 3, 1>, 170, 4, 8>;
+#endif
+#ifndef NINFER_L20_NO_PDL
 using Wide      = Fp8A8TmaSplitKSchedule<Fp8A8TmaMmaSchedule<192, 128, 128, 3, 4, 2, 1>, 170, 4, 8>;
+#endif
+#ifndef NINFER_L20_NO_PDL
 using Bulk      = Fp8A8TmaSplitKSchedule<Fp8A8TmaMmaSchedule<128, 256, 128, 2, 4, 2, 1>, 170, 4, 8>;
+#endif
 } // namespace
 
 Fp8LinearAddPlan select_fp8_add_n5120_k17408(LinearPolicy policy, std::int32_t tokens) {
-    if (!allows_a8(policy) || tokens < 20) return {select_a16(tokens)};
+#ifdef NINFER_L20_NO_PDL
+    // NINFER_L20 / sm_89: TMA-based W8A8 kernels are sm_90+; always take the
+    // activation-16 path (correct, slightly slower). FP8 weights are not used
+    // by the deployed Q8 model anyway.
+    return {select_a16(tokens)};
+#else    if (!allows_a8(policy) || tokens < 20) return {select_a16(tokens)};
     const std::size_t partial_bytes = tokens > 384   ? Bulk::kPartialBytes
                                       : tokens > 256 ? Wide::kPartialBytes
                                       : tokens > 128 ? Mid::kPartialBytes
@@ -38,5 +53,6 @@ Fp8LinearAddPlan select_fp8_add_n5120_k17408(LinearPolicy policy, std::int32_t t
     if (tokens <= 384 || (tokens > 512 && tokens <= 768))
         return {nullptr, launch_fp8_add_a8<Instance<Wide>>, partial_bytes};
     return {nullptr, launch_fp8_add_a8<Instance<Bulk>>, partial_bytes};
+#endif
 }
 } // namespace ninfer::ops::detail

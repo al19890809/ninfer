@@ -18,14 +18,26 @@ using S3 = Bf16ScheduleInstance<Bf16A16SlicedKMmaSchedule<16, 8, 4, 128, 2>, 460
 using S4 = Bf16ScheduleInstance<Bf16A16SlicedKMmaSchedule<32, 8, 4, 64, 2>, 4608>;
 using S5 = Bf16A16MmaSchedule<32, 16, 256, 16, 8, 3, 1, Cache::cg, Cache::cg,
                               Bf16MmaFragmentPipeline::PingPong, Bf16MmaRaster::TokenFast>;
+#ifndef NINFER_L20_NO_PDL
 using S6 = Bf16ScheduleInstance<Bf16A16TmaMmaSchedule<64, 32, 128, 16, 16, 3, 1>, 4608>;
+#endif
+#ifndef NINFER_L20_NO_PDL
 using S7 = Bf16ScheduleInstance<Bf16A16TmaMmaSchedule<96, 32, 128, 16, 16, 3, 1>, 4608>;
+#endif
+#ifndef NINFER_L20_NO_PDL
 using S8 = Bf16ScheduleInstance<Bf16A16TmaMmaSchedule<64, 64, 128, 32, 16, 3, 1>, 4608>;
+#endif
+#ifndef NINFER_L20_NO_PDL
 using S9 = Bf16ScheduleInstance<
     Bf16A16TmaMmaSchedule<128, 64, 64, 32, 32, 4, 1, Bf16MmaRaster::Grouped, 4>, 4608>;
+#endif
+#ifndef NINFER_L20_NO_PDL
 using S10 = Bf16A16TmaMmaSchedule<128, 128, 64, 64, 32, 3, 1>;
+#endif
+#ifndef NINFER_L20_NO_PDL
 using S11 = Bf16ScheduleInstance<
     Bf16A16TmaMmaSchedule<96, 64, 64, 48, 32, 2, 2, Bf16MmaRaster::TokenFast, 1, 9>, 4608>;
+#endif
 } // namespace
 
 Bf16Launch select_bf16_n4608_k4608(std::int32_t tokens) {
@@ -36,11 +48,11 @@ Bf16Launch select_bf16_n4608_k4608(std::int32_t tokens) {
     if (tokens <= 4) return launch_bf16_sliced_k_mma<S3>;
     if (tokens <= 16) return launch_bf16_sliced_k_mma<S4>;
     if (tokens <= 32) return launch_bf16_mma<S5>;
-    if (tokens <= 64) return launch_bf16_tma_mma<S6>;
-    if (tokens <= 96) return launch_bf16_tma_mma<S7>;
-    if (tokens <= 128) return launch_bf16_tma_mma<S8>;
-    if (tokens <= 256) return launch_bf16_tma_mma<S9>;
-    if (tokens <= 512) return launch_bf16_tma_mma<S10>;
-    return launch_bf16_tma_mma<S11>;
+    if (tokens <= 64) return launch_bf16_mma<S5>;
+    if (tokens <= 96) return launch_bf16_mma<S5>;
+    if (tokens <= 128) return launch_bf16_mma<S5>;
+    if (tokens <= 256) return launch_bf16_mma<S5>;
+    if (tokens <= 512) return launch_bf16_mma<S5>;
+    return launch_bf16_mma<S5>;
 }
 } // namespace ninfer::ops::detail

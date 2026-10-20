@@ -126,10 +126,15 @@ void storage_dispatch(KvCacheStorage storage, PagedWriteInstance instance, const
         return launch_instance<KvCacheStorage::Int8Group64, G>(instance, a, metadata, stream);
     case KvCacheStorage::Fp8E4M3Row256:
         return launch_instance<KvCacheStorage::Fp8E4M3Row256, G>(instance, a, metadata, stream);
+#ifndef NINFER_L20_NO_PDL
     case KvCacheStorage::Nvfp4Group16:
         return launch_instance<KvCacheStorage::Nvfp4Group16, G>(instance, a, metadata, stream);
     case KvCacheStorage::Fp8KeyNvfp4Value:
         return launch_instance<KvCacheStorage::Fp8KeyNvfp4Value, G>(instance, a, metadata, stream);
+#endif
+    // NINFER_L20 / sm_89: NVFP4 & K8V4 KV writes decode/encode e2m1 through
+    // sm_100a/sm_120a-only hardware; not instantiated here, so the request
+    // falls through to the "unsupported storage" error below.
     }
     throw std::logic_error("KV write: unsupported storage");
 }
