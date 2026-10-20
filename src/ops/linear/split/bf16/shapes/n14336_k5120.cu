@@ -68,14 +68,8 @@ void launch_matrix(const Tensor& x, const Weight& weight, std::span<const Tensor
                                                            stream);
     };
     const auto tma = [&]<class S>() {
-#ifdef NINFER_L20_NO_PDL
-        // NINFER_L20 / sm_89: TMA unavailable; the plain mma lambda covers the
-        // same operand contract with sm_89-supported schedules.
-        mma.template operator()<S>();
-#else
         launch_bf16_a16_tma_mma<Bf16ScheduleInstance<S, 5120>>(p, output, LinearIdentityEpilogue{},
                                                                stream);
-#endif
     };
     if (p.tokens <= 16)
         launch_bf16_a16_sliced_k_mma<Bf16ScheduleInstance<Bf16A16SlicedR32T16W4, 5120>>(
@@ -83,15 +77,35 @@ void launch_matrix(const Tensor& x, const Weight& weight, std::span<const Tensor
     else if (p.tokens <= 32)
         mma.template operator()<Bf16A16MmaR32T32K128S3>();
     else if (p.tokens <= 64)
+        #ifndef NINFER_L20_NO_PDL
         tma.template operator()<Bf16A16TmaR64T64K64S3>();
+        #else
+        // NINFER_L20 / sm_89: plain cp.async mma schedule (TMA is sm_90+).
+        mma.template operator()<Bf16A16MmaR64T32K64S3>();
+        #endif
     else if (p.tokens <= 96)
         mma.template operator()<Bf16A16MmaR64T32K64S3>();
     else if (p.tokens <= 128)
+        #ifndef NINFER_L20_NO_PDL
         tma.template operator()<Bf16A16TmaR64T128K64S2>();
+        #else
+        // NINFER_L20 / sm_89: plain cp.async mma schedule (TMA is sm_90+).
+        mma.template operator()<Bf16A16MmaR64T32K64S3>();
+        #endif
     else if (p.tokens <= 192)
+        #ifndef NINFER_L20_NO_PDL
         tma.template operator()<Bf16A16TmaR64T64K64S3>();
+        #else
+        // NINFER_L20 / sm_89: plain cp.async mma schedule (TMA is sm_90+).
+        mma.template operator()<Bf16A16MmaR64T32K64S3>();
+        #endif
     else
+        #ifndef NINFER_L20_NO_PDL
         tma.template operator()<Bf16A16TmaR64T128K64S2>();
+        #else
+        // NINFER_L20 / sm_89: plain cp.async mma schedule (TMA is sm_90+).
+        mma.template operator()<Bf16A16MmaR64T32K64S3>();
+        #endif
 }
 
 void launch_split(const Tensor& x, Weights weights, std::span<const Tensor> outputs, MemoryArena*,
