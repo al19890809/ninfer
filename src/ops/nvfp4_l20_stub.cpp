@@ -15,7 +15,12 @@
 #include "ops/linear/split/nvfp4/shapes/n14336_k5120/launch.h"
 #include "ops/linear/split/nvfp4/shapes/n16384_k5120/launch.h"
 #include "ops/linear_attention/gated_delta_net/input_conv/nvfp4/tma_launch.h"
-#include "ops/softmax_attention/dense/causal_cache/nvfp4/plan.h"
+#include "ops/linear/projection/nvfp4/nvfp4_dispatch.h"
+#include "ops/linear/swiglu/nvfp4/tma_launch.h"
+#include "ops/softmax_attention/dense/causal_cache/k8v4/plan.h"
+#include "ops/softmax_attention/dense/causal_cache/k8v4/launch.h"
+#include "ops/softmax_attention/dense/causal_cache/nvfp4/launch.h"
+#include "ops/softmax_attention/dense/causal_cache/nvfp4/plan.h
 #include "ops/moe/kernels/cuda/block_scaled/fp8/launch.h"
 #include "ops/moe/kernels/cuda/block_scaled/nvfp4/launch.h"
 
@@ -61,9 +66,48 @@ void launch_a4_tma(const Nvfp4A4Operands&, std::span<const Tensor>, cudaStream_t
 }
 } // namespace linear_split::nvfp4_n16384_k5120
 
-// ---- dense causal attention: NVFP4 KV plan -------------------------------
+// ---- linear projection / swiglu nvfp4 entries (host dispatchers) ---------
+
+std::size_t nvfp4_linear_workspace_capacity_bytes(std::int32_t, std::int32_t, LinearPolicy,
+                                                  std::int32_t, std::int32_t) {
+    nvfp4_unsupported();
+}
+void nvfp4_dispatch(const Tensor&, const Weight&, Tensor&, LinearPolicy, MemoryArena*,
+                    cudaStream_t) {
+    nvfp4_unsupported();
+}
+void launch_nvfp4_swiglu_a4_tma(const Nvfp4A4Operands&, __nv_bfloat16*, cudaStream_t) {
+    nvfp4_unsupported();
+}
+
+// ---- dense causal attention: NVFP4 / K8V4 KV plans + kernels --------------
 
 std::size_t nvfp4_kv_workspace_bytes(int, int, int, int, CausalAttentionExecutionEnvelope, int) {
+    nvfp4_unsupported();
+}
+std::size_t k8v4_kv_workspace_bytes(int, int, int, int, CausalAttentionExecutionEnvelope, int) {
+    nvfp4_unsupported();
+}
+void nvfp4_kv_append_attention(const Tensor&, const Tensor&, const Tensor&, const Tensor&,
+                               const Tensor&, const Tensor&, float, PagedKVBatchLayerView,
+                               CausalAttentionExecutionEnvelope, MemoryArena&, Tensor&,
+                               CudaExecutionView) {
+    nvfp4_unsupported();
+}
+void nvfp4_kv_cached_attention(const Tensor&, const Tensor&, float, const PagedKVLayerView&,
+                               CausalAttentionExecutionEnvelope, MemoryArena&, Tensor&,
+                               CudaExecutionView) {
+    nvfp4_unsupported();
+}
+void k8v4_kv_append_attention(const Tensor&, const Tensor&, const Tensor&, const Tensor&,
+                              const Tensor&, const Tensor&, float, PagedKVBatchLayerView,
+                              CausalAttentionExecutionEnvelope, MemoryArena&, Tensor&,
+                              CudaExecutionView) {
+    nvfp4_unsupported();
+}
+void k8v4_kv_cached_attention(const Tensor&, const Tensor&, float, const PagedKVLayerView&,
+                              CausalAttentionExecutionEnvelope, MemoryArena&, Tensor&,
+                              CudaExecutionView) {
     nvfp4_unsupported();
 }
 
